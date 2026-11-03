@@ -18,6 +18,23 @@ class ManualDependencyError(RuntimeError):
     pass
 
 
+class FeatureData(tuple):
+    """A (features, labels) pair that also carries the settings used to extract the features.
+
+    It unpacks like a plain 2-tuple, so ``(features, labels) = load_data(path)`` keeps working;
+    the settings are in ``.params`` (a dict, or None if unknown).
+    """
+
+    def __new__(cls, features, labels, params=None):
+        self = super().__new__(cls, (features, labels))
+        self.params = params
+        return self
+
+    def __getnewargs__(self):
+        # used by pickle: rebuild from (features, labels); .params is restored from __dict__
+        return tuple(self)
+
+
 def dump_data(data, out_file, verbose=True):
     """Save data to pickle file
 

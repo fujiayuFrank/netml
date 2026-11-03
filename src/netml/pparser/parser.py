@@ -4,6 +4,7 @@
 
 """
 import ipaddress
+import itertools
 from collections import OrderedDict
 from datetime import datetime
 
@@ -20,13 +21,62 @@ import pandas as pd
 #
 from scapy.all import *
 
-from scapy.layers.inet import IP, TCP, UDP
+from scapy.data import ETHER_TYPES, IP_PROTOS
+from scapy.layers.eap import EAPOL
+from scapy.layers.inet import ICMP, IP, TCP, UDP
+from scapy.layers.inet6 import IPv6, _ICMPv6, _IPv6ExtHdr
+from scapy.layers.ipsec import AH, ESP
+from scapy.layers.l2 import ARP, GRE, STP, CookedLinux, Dot1Q, Ether
+from scapy.layers.ppp import PPPoE, PPPoED
+from scapy.layers.sctp import SCTP
+from scapy.layers.vrrp import VRRP, VRRPv3
 
 from netml.utils.tool import data_info, timing
 
 
+def _get_pkt_len(pkt):
+    """Get the original length of a packet on the wire.
+
+    ``len(pkt)`` is the number of *captured* bytes, which is smaller than the real packet
+    when the pcap was recorded with a small snaplen (e.g. 200 bytes). The pcap record keeps
+    the original length, which scapy exposes as ``pkt.wirelen``.
+
+    Parameters
+    ----------
+    pkt:
+        a packet
+    Returns
+    -------
+        pkt_len: int
+    """
+    if pkt.wirelen is None:
+        # packets built in memory (not read from a pcap) have no wire length
+        return len(pkt)
+    return pkt.wirelen
+
+
+def _get_ip_layer(pkt):
+    """Get the IPv4 or IPv6 layer of a packet, or None if it has neither."""
+    # (getlayer looks each layer up once; "X in pkt" followed by pkt[X] would do it twice)
+    ip = pkt.getlayer(IP)
+    if ip is None:
+        ip = pkt.getlayer(IPv6)
+    return ip
+
+
+def _get_ttl(pkt):
+    """Get the IPv4 TTL, or the IPv6 hop limit (its IPv6 equivalent)."""
+    ip = pkt.getlayer(IP)
+    if ip is not None:
+        return ip.ttl
+    ipv6 = pkt.getlayer(IPv6)
+    if ipv6 is not None:
+        return ipv6.hlim
+    return 0
+
+
 def _get_fid(pkt):
-    """Extract fid (five-tuple) from a packet: only focus on IPv4
+    """Extract fid (five-tuple) from an IPv4 or IPv6 packet
     Parameters
     ----------
 
@@ -34,17 +84,128 @@ def _get_fid(pkt):
     -------
         fid: five-tuple
     """
+    ip = _get_ip_layer(pkt)
+    if ip is None:  # others
+        return ('', '', -1, -1, -1)
 
-    if IP in pkt and TCP in pkt:
+    tcp = pkt.getlayer(TCP)
+    if tcp is not None:
         # flow_type = 'TCP'
-        fid = (pkt[IP].src, pkt[IP].dst, pkt[TCP].sport, pkt[TCP].dport, 6)
-    elif IP in pkt and UDP in pkt:
-        # flow_type = 'UDP'
-        fid = (pkt[IP].src, pkt[IP].dst, pkt[UDP].sport, pkt[UDP].dport, 17)
-    else:  # others
-        fid = ('', '', -1, -1, -1)
+        return (ip.src, ip.dst, tcp.sport, tcp.dport, 6)
 
-    return fid
+    udp = pkt.getlayer(UDP)
+    if udp is not None:
+        # flow_type = 'UDP'
+        return (ip.src, ip.dst, udp.sport, udp.dport, 17)
+
+    return ('', '', -1, -1, -1)  # others
+
+
+def _has_icmpv6(pkt):
+    """True if the packet has an ICMPv6 layer.
+
+    scapy has one class per ICMPv6 message type (ICMPv6EchoRequest, ICMPv6ND_NS, ...), all
+    subclasses of _ICMPv6, and ``X in pkt`` only matches the exact class, so check the base class.
+    """
+    return any(issubclass(layer, _ICMPv6) for layer in pkt.layers())
+
+
+def _get_ip_proto_number(pkt):
+    """Get the IP protocol number (IPv4 'proto', IPv6 'nh'), or None if the packet is not IP.
+
+    For IPv6, extension headers (hop-by-hop, routing, fragment, ...) are skipped: each one names
+    the next header in its own 'nh' field, and the last one names the actual protocol.
+    """
+    if IP in pkt:
+        return pkt[IP].proto
+    if IPv6 not in pkt:
+        return None
+
+    ipv6 = pkt[IPv6]
+    proto = ipv6.nh
+    layer = ipv6.payload
+    while isinstance(layer, _IPv6ExtHdr):
+        proto = layer.nh
+        layer = layer.payload
+    return proto
+
+
+def _get_ethertype(pkt):
+    """Get the EtherType (the protocol carried by the link layer), or None.
+
+    For VLAN-tagged frames, the EtherType inside the (first) VLAN tag is used.
+    """
+    if Dot1Q in pkt:
+        return pkt[Dot1Q].type
+    if Ether in pkt:
+        return pkt[Ether].type
+    if CookedLinux in pkt:  # Linux "any" interface captures
+        return pkt[CookedLinux].proto
+    return None
+
+
+def _lookup_protocol_name(table, number):
+    """Look up a protocol number in one of scapy's name tables (loaded from /etc/protocols and
+    /etc/ethertypes). Returns the upper-cased name, or None if the number is not in the table."""
+    if number is None or number not in table:
+        return None
+    return table[number].upper()
+
+
+def _get_protocol_from_number(pkt):
+    """Name the protocol from the numbers in the packet's own headers.
+
+    IP packets: the IP protocol number, e.g. 2 -> 'IGMP', 89 -> 'OSPF'.
+    Other frames: the EtherType, e.g. 0x88cc -> 'LLDP'.
+    Returns None if the number has no name.
+    """
+    ip_proto = _get_ip_proto_number(pkt)
+    if ip_proto is not None:
+        # an IP packet: don't fall back to the EtherType, which would only say 'IPV4'/'IPV6'
+        return _lookup_protocol_name(IP_PROTOS, ip_proto)
+
+    return _lookup_protocol_name(ETHER_TYPES, _get_ethertype(pkt))
+
+
+def _get_protocol(pkt):
+    """Get the protocol name of a packet.
+
+    1. Protocols checked explicitly, in this order (the first match wins). TCP and UDP come
+       first, so tunneled TCP/UDP (e.g. over GRE) is labeled by the inner protocol, as before.
+    2. Otherwise, the name of the protocol number in the packet's headers
+       (see _get_protocol_from_number). This covers protocols scapy cannot dissect.
+    3. Otherwise, None.
+    """
+    if TCP in pkt:
+        protocol = 'TCP'
+    elif UDP in pkt:
+        protocol = 'UDP'
+    elif ICMP in pkt:
+        protocol = 'ICMP'
+    elif _has_icmpv6(pkt):
+        protocol = 'ICMPv6'
+    elif SCTP in pkt:
+        protocol = 'SCTP'
+    elif GRE in pkt:
+        protocol = 'GRE'
+    elif ESP in pkt:
+        protocol = 'ESP'
+    elif AH in pkt:
+        protocol = 'AH'
+    elif (VRRP in pkt) or (VRRPv3 in pkt):
+        protocol = 'VRRP'
+    elif ARP in pkt:
+        protocol = 'ARP'
+    elif EAPOL in pkt:
+        protocol = 'EAPOL'
+    elif STP in pkt:
+        protocol = 'STP'
+    elif (PPPoED in pkt) or (PPPoE in pkt):
+        protocol = 'PPPoE'
+    else:
+        protocol = _get_protocol_from_number(pkt)
+
+    return protocol
 
 
 def _get_frame_time(pkt):
@@ -113,23 +274,24 @@ def _pcap2flows(pcap_file, flow_pkts_thres=2, *, tcp_timeout=600, udp_timeout=60
     # that belongs to the flow.
     flows = OrderedDict()
     try:
-        # iteratively get each packet from the pcap
-        for i, pkt in enumerate(PcapReader(pcap_file)):
-            if (verbose > 3) and (i % 10000 == 0):
-                print(f'ith_packets: {i}')
+        # iteratively get each packet from the pcap; "with" closes the file when done
+        with PcapReader(pcap_file) as pcap_reader:
+            for i, pkt in enumerate(pcap_reader):
+                if (verbose > 3) and (i % 10000 == 0):
+                    print(f'ith_packets: {i}')
 
-            if (TCP in pkt) or (UDP in pkt):
+                if (TCP in pkt) or (UDP in pkt):
 
-                # this function treats bidirection flows as two sessions (hereafter, we use sessions
-                # and flows interchangeably).
-                fid = _get_fid(pkt)
+                    # this function treats bidirection flows as two sessions (hereafter, we use
+                    # sessions and flows interchangeably).
+                    fid = _get_fid(pkt)
 
-                if fid not in flows.keys():
-                    flows[fid] = [pkt]
+                    if fid not in flows.keys():
+                        flows[fid] = [pkt]
+                    else:
+                        flows[fid].append(pkt)
                 else:
-                    flows[fid].append(pkt)
-            else:
-                continue
+                    continue
 
     except Exception as e:
         msg = f'Parse PCAP error: {e}!'
@@ -156,41 +318,29 @@ def _pcap2flows(pcap_file, flow_pkts_thres=2, *, tcp_timeout=600, udp_timeout=60
             pkt_time = _get_frame_time(pkt)
             if j == 0:
                 subflow_tmp = [pkt]
-                split_flow = False  # if a flow is not split with interval, label it as False, otherwise, True
                 continue
-            # print(fid, pkt)
-            if (6 in fid) or (TCP in pkt):
+            # the protocol is the last item of the fid: "6 in fid" would also match a port number
+            if fid[4] == 6:
                 # handle TCP packets, TCP is 6
                 # a timeout (the idle time) is the duration between the previous pkt and the current one.
                 if pkt_time - _get_frame_time(subflow_tmp[-1]) > tcp_timeout:
-                    # Note: here subflow_tmp will only have 1 packet
                     subflows.append((fid, subflow_tmp))
                     subflow_tmp = [pkt]  # create a new subflow and store the current packet as the first packet of it.
-                    split_flow = True
                 else:
                     subflow_tmp.append(pkt)
-            elif (17 in fid) or UDP in pkt:
+            elif fid[4] == 17:
                 # handle UDP packets, UDP is 17
                 if pkt_time - _get_frame_time(subflow_tmp[-1]) > udp_timeout:
-                    # print(fid, len(subflow_tmp))
-                    # Note: here subflow_tmp will only have 1 packet
-                    # E.g., without timeout splitting, the flow has two packets, pkt1 (time=2020-08-06 11:01:20.029699)
-                    # and pkt2 (time=2020-08-07 01:01:20.376141), so after timeout splitting, subflow_tmp = [pkt1]
-                    # (only one packet)
                     subflows.append((fid, subflow_tmp))
                     subflow_tmp = [pkt]
-                    split_flow = True
                 else:
                     subflow_tmp.append(pkt)
             else:  # it's not possible, because flows only include TCP and UDP flows
                 pass
 
-        # if the current flow is not split by TIMEOUT, then add it into subflows
-        if not split_flow:
-            subflows.append((fid, subflow_tmp))
-        else:
-            # discard the last subflow_tmp
-            pass
+        # the last subflow (the whole flow, if it was not split by TIMEOUT); subflows with too few
+        # packets are discarded below, like the others
+        subflows.append((fid, subflow_tmp))
 
         new_flows.extend(subflows)
 
@@ -247,10 +397,10 @@ def _flows2subflows(flows, interval=10, *, flow_pkts_thres=2, verbose=0):
             if j == 0:
                 subflow_tmp_start_time = pkt_time
                 subflow_tmp = [(subflow_tmp_start_time, pkt)]
-                split_flow = False  # if a flow is not split with interval, label it as False, otherwise, True
                 continue
 
-            if (6 in fid) or (TCP in pkt):
+            # the protocol is the last item of the fid: "6 in fid" would also match a port number
+            if fid[4] == 6:
                 # handle TCP packets, TCP is 6
                 # a timeout (the idle time) is the duration between the previous pkt and the current one.
                 if pkt_time - subflow_tmp[-1][0] > interval:
@@ -259,28 +409,23 @@ def _flows2subflows(flows, interval=10, *, flow_pkts_thres=2, verbose=0):
                     # create a new subflow and store "subflow_tmp_start_time" as the time. Here, it will has a tiny
                     # difference of packet time between "subflow_tmp_start_time" and the current packet time.
                     subflow_tmp = [(subflow_tmp_start_time, pkt)]
-                    split_flow = True
                 else:
                     subflow_tmp.append((pkt_time, pkt))
 
-            elif (17 in fid) or UDP in pkt:
+            elif fid[4] == 17:
                 # handle UDP packets, UDP is 17
                 if pkt_time - subflow_tmp[-1][0] > interval:
                     subflows.append((fid, subflow_tmp))
                     subflow_tmp_start_time += int((pkt_time - subflow_tmp_start_time) // interval) * interval
                     subflow_tmp = [(subflow_tmp_start_time, pkt)]
-                    split_flow = True
                 else:
                     subflow_tmp.append((pkt_time, pkt))
             else:  # it's not possible, because flows only include TCP and UDP flows
                 pass
 
-        # if the current flow is not split by interval, then add it into subflows
-        if not split_flow:
-            subflows.append([fid, subflow_tmp])
-        else:
-            # discard the last subflow_tmp
-            pass
+        # the last subflow (the whole flow, if it was not split by interval); subflows with too few
+        # packets are discarded below, like the others
+        subflows.append((fid, subflow_tmp))
 
         new_flows.extend(subflows)
 
@@ -299,6 +444,28 @@ def _flows2subflows(flows, interval=10, *, flow_pkts_thres=2, verbose=0):
     return new_flows
 
 
+# bit i of the TCP flags field, for i = 0..7, is the flag F S R P A U E C (FIN, SYN, RST, PSH, ACK,
+# URG, ECE, CWR): the order of the flag counts in the header features
+_TCP_FLAG_BITS = np.arange(8)
+
+
+def _count_tcp_flags(flag_values):
+    """Count how often each TCP flag (F S R P A U E C) is set.
+
+    Parameters
+    ----------
+    flag_values: list of int
+        the TCP flags field of each packet
+
+    Returns
+    -------
+        counts: numpy array of 8 floats
+    """
+    values = np.asarray(flag_values, dtype=np.int64).reshape(-1, 1)
+    is_set = (values >> _TCP_FLAG_BITS) & 1
+    return is_set.sum(axis=0).astype(float)
+
+
 def _get_header_features(flows):
     """Extract header features which includes TCP Flags and TTL
     Parameters
@@ -308,45 +475,18 @@ def _get_header_features(flows):
     -------
        headers: a list
     """
-
-    def _parse_tcp_flgs(tcp_flgs):
-        # flags = {
-        #     'F': 'FIN',
-        #     'S': 'SYN',
-        #     'R': 'RST',
-        #     'P': 'PSH',
-        #     'A': 'ACK',
-        #     'U': 'URG',
-        #     'E': 'ECE',
-        #     'C': 'CWR',
-        # }
-        flgs = {
-            'F': 0,
-            'S': 0,
-            'R': 0,
-            'P': 0,
-            'A': 0,
-            'U': 0,
-            'E': 0,
-            'C': 0,
-        }
-
-        for flg in tcp_flgs:
-            if flg in flgs.keys():
-                flgs[flg] += 1
-
-        return list(flgs.values())
-
     features = []
     for fid, pkts in flows:
-        flgs_lst = np.zeros((8, 1))  # 8 TCP flags
+        tcp_flag_values = []
         header_features = []
-        for i, pkt in enumerate(pkts):
-            if pkt.payload.proto == 6:  # tcp
-                flgs_lst += np.asarray(_parse_tcp_flgs(pkt.payload.payload.flags)).reshape(-1, 1)  # parses tcp.flgs
-            header_features.append(pkt.payload.ttl)
+        for pkt in pkts:
+            tcp = pkt.getlayer(TCP)
+            if tcp is not None:
+                tcp_flag_values.append(int(tcp.flags))
+            header_features.append(_get_ttl(pkt))
 
-        features.append(list(flgs_lst.flatten()) + header_features)
+        flag_counts = _count_tcp_flags(tcp_flag_values)  # 8 TCP flags, for the whole flow
+        features.append(list(flag_counts) + header_features)
 
     return features
 
@@ -391,7 +531,7 @@ def _get_SIZE(flows):
     features = []
     fids = []
     for fid, pkts in flows:
-        sizes = [len(pkt) for pkt in pkts]
+        sizes = [_get_pkt_len(pkt) for pkt in pkts]
         features.append(sizes)
         fids.append(fid)
 
@@ -416,7 +556,7 @@ def _get_IAT_SIZE(flows):
     for fid, pkts in flows:
         pkt_times = [_get_frame_time(pkt) for pkt in pkts]
         iats = list(np.diff(pkt_times))
-        sizes = [len(pkt) for pkt in pkts]
+        sizes = [_get_pkt_len(pkt) for pkt in pkts]
         iats_sizes = []
         for j in range(len(iats)):
             iats_sizes.extend([iats[j], sizes[j]])
@@ -446,11 +586,11 @@ def _get_STATS(flows):
     features = []
     fids = []
     for fid, pkts in flows:
-        sizes = [len(pkt) for pkt in pkts]
+        sizes = [_get_pkt_len(pkt) for pkt in pkts]
 
         sub_duration = _get_flow_duration(pkts)
         num_pkts = len(sizes)  # number of packets in the flow
-        num_bytes = sum(sizes)  # all bytes in sub_duration  sum(len(pkt))
+        num_bytes = sum(sizes)  # all bytes in sub_duration: sum of wire lengths
         if sub_duration == 0:
             pkts_rate = 0.0
             bytes_rate = 0.0
@@ -507,7 +647,7 @@ def _get_SAMP(flows, sampling_feature='SAMP_NUM', sampling_rate=0.1, verbose=0):
         # for each flow
         each_flow_features = []
         pkt_times = [_get_frame_time(pkt) for pkt in pkts]
-        pkt_sizes = [len(pkt) for pkt in pkts]
+        pkt_sizes = [_get_pkt_len(pkt) for pkt in pkts]
         samp_sub = -1
         for i in range(len(pkts)):
             if i == 0:
@@ -621,6 +761,42 @@ def _get_split_interval(flow_durations, q_interval=0.9):
     return interval
 
 
+def _get_flow_durations(flows):
+    return [_get_flow_duration(pkts) for fid, pkts in flows]
+
+
+def _get_pkts_dim(flows, q_interval):
+    """Number of packets per flow that features are fixed to: the q_interval quantile of the
+    number of packets per flow."""
+    num_pkts = [len(pkts) for fid, pkts in flows]
+    return int(np.floor(np.quantile(num_pkts, q_interval)))
+
+
+def _get_sampling_rate(flows):
+    """Window length (seconds) for SAMP_* features: the 0.3 quantile of flow durations."""
+    # To obtain different samp_features, you should change q_interval ((0, 1))
+    return _get_split_interval(_get_flow_durations(flows), q_interval=0.3)
+
+
+def get_shared_interval(pcaps, q_interval=0.9):
+    """Split interval shared by several PCAPs: the q_interval quantile of the durations of all
+    their (not yet split) flows. Call PCAP.extract_flows() on each PCAP first.
+
+    Using one interval for all PCAPs makes their features comparable: every flow is then split
+    by the same rule, whichever pcap it comes from.
+    """
+    all_flows = list(itertools.chain.from_iterable(pcap.raw_flows for pcap in pcaps))
+    return _get_split_interval(_get_flow_durations(all_flows), q_interval=q_interval)
+
+
+def get_shared_pkts_dim(pcaps, q_interval=0.9):
+    """Feature length shared by several PCAPs: the q_interval quantile of the number of packets
+    per (sub)flow over all of them. Call PCAP.split_flows() (or pcap2flows()) on each PCAP first.
+    """
+    all_flows = list(itertools.chain.from_iterable(pcap.flows for pcap in pcaps))
+    return _get_pkts_dim(all_flows, q_interval)
+
+
 def _get_FFT_data(features, fft_bin='', fft_part='real'):
     """Do fft transform of features
 
@@ -713,26 +889,58 @@ class PCAP:
             each element in the list represents a flow, and each flow includes 2 values: flow id (five-tuple) and packets.
         """
 
+        # always kept: flow2features uses it for the feature dimension, even if "interval" is given
+        self.q_interval = q_interval
+
         # extract all flows firstly and then split flows to subflows
-        flows = _pcap2flows(self.pcap_file, self.flow_ptks_thres, tcp_timeout=tcp_timeout, udp_timeout=udp_timeout,
-                            verbose=self.verbose)
+        self.extract_flows(tcp_timeout=tcp_timeout, udp_timeout=udp_timeout)
 
-        if interval > 0:
-            self.interval = interval
-        else:
-            if q_interval > 0:
-                self.q_interval = q_interval
-
-                self.flow_durations = [_get_flow_duration(pkts) for fid, pkts in flows]
-                if self.verbose > 3:
-                    data_info(np.asarray(self.flow_durations, dtype=float).reshape(-1, 1), name='flow_durations')
-                self.interval = _get_split_interval(self.flow_durations, q_interval=self.q_interval)
-
-            else:
+        if interval <= 0:
+            if q_interval <= 0:
                 msg = f'q_interval must be in [0, 1]! Current q_interval is {q_interval}.'
                 raise ValueError(msg)
 
-        self.flows = _flows2subflows(flows, self.interval, flow_pkts_thres=self.flow_ptks_thres, verbose=self.verbose)
+            self.flow_durations = _get_flow_durations(self.raw_flows)
+            if self.verbose > 3:
+                data_info(np.asarray(self.flow_durations, dtype=float).reshape(-1, 1),
+                          name='flow_durations')
+            interval = _get_split_interval(self.flow_durations, q_interval=q_interval)
+
+        self.split_flows(interval)
+        self.raw_flows = None  # not needed anymore; free the packets dropped by the split
+
+    def extract_flows(self, *, tcp_timeout=600, udp_timeout=600):
+        """Extract whole flows (not yet split into subflows) into self.raw_flows.
+
+        First step of pcap2flows(). Together with split_flows(), it lets several PCAPs be split
+        with one shared interval (see get_shared_interval()).
+
+        Parameters
+        ----------
+        tcp_timeout: int (default is 600s)
+            a value is to split flow by tcp_timeout.
+
+        udp_timeout: int (default is 600s)
+            a value is to split flow by udp_timeout.
+        """
+        self.raw_flows = _pcap2flows(self.pcap_file, self.flow_ptks_thres, tcp_timeout=tcp_timeout,
+                                     udp_timeout=udp_timeout, verbose=self.verbose)
+
+    def split_flows(self, interval):
+        """Split self.raw_flows (from extract_flows()) into subflows, into self.flows. Second step
+        of pcap2flows().
+
+        A flow is split wherever the time between two consecutive packets is longer than
+        "interval" (so it is an idle-time threshold, not a fixed window length).
+
+        Parameters
+        ----------
+        interval: float
+            an time interval is used to split a flow.
+        """
+        self.interval = interval
+        self.flows = _flows2subflows(self.raw_flows, interval,
+                                     flow_pkts_thres=self.flow_ptks_thres, verbose=self.verbose)
 
     def pcap2flows(self, interval=0.0, q_interval=0.9, *, tcp_timeout=600, udp_timeout=600):
         """Extract flows from the given pcap and split each flow to subflow by "interval" or "q_interval".
@@ -760,7 +968,8 @@ class PCAP:
         self.pcap2flows.__dict__['tot_time'] = tot_time
 
     @timing
-    def _flow2features(self, feat_type='IAT', *, fft=False, header=False):
+    def _flow2features(self, feat_type='IAT', *, fft=False, header=False, pkts_dim=None,
+                       sampling_rate=None):
         """Extract features from each flow according to feat_type, fft and header.
 
         Parameters
@@ -780,9 +989,20 @@ class PCAP:
         """
         self.feat_type = feat_type
 
-        num_pkts = [len(pkts) for fid, pkts in self.flows]
+        if pkts_dim is None:
+            q_interval = getattr(self, 'q_interval', None)
+            if q_interval is None:
+                raise ValueError('pkts_dim is required when the flows were not split by '
+                                 'pcap2flows()')
+            # use the same q_interval to get the dimension
+            pkts_dim = _get_pkts_dim(self.flows, q_interval)
+        self.pkts_dim = pkts_dim
+        dim = pkts_dim
 
-        dim = int(np.floor(np.quantile(num_pkts, self.q_interval)))  # use the same q_interval to get the dimension
+        is_samp = feat_type in ['SAMP_NUM', 'FFT-SAMP_NUM', 'SAMP_SIZE', 'FFT-SAMP_SIZE']
+        if is_samp and sampling_rate is None:
+            sampling_rate = _get_sampling_rate(self.flows)
+        self.sampling_rate = sampling_rate
 
         if feat_type in ['IAT', 'FFT-IAT']:
             self.dim = dim - 1
@@ -798,14 +1018,9 @@ class PCAP:
             self.features, self.fids = _get_STATS(self.flows)
         elif feat_type in ['SAMP_NUM', 'FFT-SAMP_NUM']:
             self.dim = dim - 1
-            flow_durations = [_get_flow_duration(pkts) for fid, pkts in self.flows]
-            # To obtain different samp_features, you should change q_interval ((0, 1))
-            sampling_rate = _get_split_interval(flow_durations, q_interval=0.3)
             self.features, self.fids = _get_SAMP_NUM(self.flows, sampling_rate)
         elif feat_type in ['SAMP_SIZE', 'FFT-SAMP_SIZE']:
             self.dim = dim - 1  # here the dim of "SAMP_SIZE" is dim -1, which equals to the dimension of 'SAMP_NUM'
-            flow_durations = [_get_flow_duration(pkts) for fid, pkts in self.flows]
-            sampling_rate = _get_split_interval(flow_durations, q_interval=0.3)
             self.features, self.fids = _get_SAMP_SIZE(self.flows, sampling_rate)
         else:
             msg = f'feat_type ({feat_type}) is not correct! '
@@ -833,7 +1048,8 @@ class PCAP:
         if self.verbose > 5:
             print(np.all(self.features >= 0))
 
-    def flow2features(self, feat_type='IAT', *, fft=False, header=False):
+    def flow2features(self, feat_type='IAT', *, fft=False, header=False, pkts_dim=None,
+                      sampling_rate=None):
         """Extract features from each flow according to feat_type, fft and header.
 
         Parameters
@@ -847,11 +1063,22 @@ class PCAP:
         header: boolean (default is False)
             if we need header+features
 
+        pkts_dim: int (default is None)
+            the number of packets per flow that features are fixed to (e.g. IAT features have
+            pkts_dim - 1 values). By default, the q_interval quantile of the number of packets per
+            flow in this pcap. Pass a fixed value (e.g. from get_shared_pkts_dim(), or the value
+            used for training) so that features from different pcaps have the same length.
+
+        sampling_rate: float (default is None)
+            window length (seconds) for SAMP_* features. By default, the 0.3 quantile of the flow
+            durations in this pcap.
+
         Returns
         -------
             self
         """
-        _, tot_time = self._flow2features(feat_type, fft=fft, header=header)
+        _, tot_time = self._flow2features(feat_type, fft=fft, header=header, pkts_dim=pkts_dim,
+                                          sampling_rate=sampling_rate)
         self.flow2features.__dict__['tot_time'] = tot_time
 
     @timing
@@ -972,12 +1199,13 @@ class PCAP:
 
               "time"      : time the packet was receieved in seconds since epoch
               "datetime"  : time the packet was received as a datetime object
-              "length"    : length of packet in bytes
+              "length"    : original (wire) length of packet in bytes
               "mac_src"   : source MAC address
               "mac_dst"   : destination MAC address
-              "ip_src"    : source IP address
-              "ip_dst"    : destination IP address
-              "protocol"  : 'TCP', 'UDP', 'ICMP', or None
+              "ip_src"    : source IP address (IPv4 or IPv6)
+              "ip_dst"    : destination IP address (IPv4 or IPv6)
+              "protocol"  : protocol name, e.g. 'TCP', 'UDP', 'ICMP', 'ICMPv6', 'ARP', 'IGMP',
+                            or None if it cannot be identified (see _get_protocol)
               "port_src"  : source port
               "port_dst"  : destination port
               "is_dns"    : True if packet is DNS packet, else False
@@ -992,7 +1220,7 @@ class PCAP:
                 pkt_dict.update(
                     time=pkt.time,
                     datetime=datetime.fromtimestamp(int(pkt.time)),
-                    length=len(pkt),
+                    length=_get_pkt_len(pkt),
                     is_dns=False,
                 )
 
@@ -1000,20 +1228,19 @@ class PCAP:
                     pkt_dict['mac_dst'] = pkt[Ether].dst
                     pkt_dict['mac_src'] = pkt[Ether].src
 
-                if IP in pkt:
-                    pkt_dict['ip_dst'] = pkt[IP].dst
-                    pkt_dict['ip_src'] = pkt[IP].src
+                ip = _get_ip_layer(pkt)
+                if ip is not None:
+                    pkt_dict['ip_dst'] = ip.dst
+                    pkt_dict['ip_src'] = ip.src
 
                 if TCP in pkt:
                     pkt_dict['port_dst'] = pkt[TCP].dport
                     pkt_dict['port_src'] = pkt[TCP].sport
-                    pkt_dict['protocol'] = 'TCP'
                 elif UDP in pkt:
                     pkt_dict['port_dst'] = pkt[UDP].dport
                     pkt_dict['port_src'] = pkt[UDP].sport
-                    pkt_dict['protocol'] = 'UDP'
-                elif ICMP in pkt:
-                    pkt_dict['protocol'] = 'ICMP'
+
+                pkt_dict['protocol'] = _get_protocol(pkt)
 
                 if (dnsqr := pkt.getlayer(DNSQR)) is not None:
                     pkt_dict.update(

@@ -276,14 +276,267 @@ library development & management module
 - `tox.ini`
 
 
+## Changes (November 2026)
+
+This section lists the fixes and changes made to `pparser` (`src/netml/pparser/parser.py`), the CLI (`src/netml/cli.py`) and `src/netml/utils/tool.py`. The reasoning behind each choice, and the alternatives, are in [Design decisions](#design-decisions-november-2026).
+
+### Dependency fixes
+
+**Packet length (`len(pkt)`)**
+
+* **Problem:** `len(pkt)` is the number of bytes *captured*, not the size of the packet on the wire. In pcaps recorded with a small snapshot length, sizes were capped. In `netflix.pcap`, for example, every record is cut at 200 bytes, while real packets reach 1514 bytes.
+* **Fix:** sizes now come from `pkt.wirelen`, the original length stored in every pcap record. `len(pkt)` is used only when there is no `wirelen` (packets built in memory). The helper is `_get_pkt_len`.
+* **Affected:** `pcap2pandas()` (`length` column), `_get_SIZE()`, `_get_IAT_SIZE()`, `_get_STATS()` and `_get_SAMP()` (`SAMP_SIZE`).
+* **Checked against Wireshark:** the lengths now match the `Length` column of Wireshark exports for every packet of `netflix.pcap` (141,471 packets) and `http.pcap` (24,798). For pcaps that are not truncated, nothing changes.
+
+**IPv6 (`pkt[IP]` is IPv4 only)**
+
+* **Problem:** IPv6 TCP/UDP packets all got the same placeholder flow ID `('', '', -1, -1, -1)`, so unrelated IPv6 connections were merged into one fake flow. `pcap2pandas()` left their addresses empty, and `_get_header_features()` crashed on them.
+* **Fix:** the IP layer is now IPv4 *or* IPv6 (`_get_ip_layer`), and the TTL is the IPv4 TTL or the IPv6 hop limit (`_get_ttl`).
+* **Affected:** `_get_fid()`, `pcap2pandas()` and `_get_header_features()`.
+* **Integer address columns:** in a pcap with IPv6, `ip_src_int` / `ip_dst_int` hold exact 128-bit Python integers, so these columns become `object` instead of `float`.
+
+**Header features assumed one packet layout**
+
+* **Problem:** `_get_header_features()` read `pkt.payload.proto`, `pkt.payload.ttl` and `pkt.payload.payload.flags`. That only works for Ethernet → IPv4 → TCP:
+  * IPv6 packets and raw-IP captures (no link-layer header) crashed.
+  * VLAN-tagged frames silently got all-zero TCP flag counts.
+* **Fix:** the TCP and IP layers are now found by type. All of Ethernet, VLAN, raw IP and Linux "cooked" captures, with IPv4, IPv6 and IPv6 extension headers, give correct values.
+
+**Protocol labels in `pcap2pandas()`**
+
+* **Problem:** only TCP, UDP and ICMP were labeled. Everything else (ARP, ICMPv6, IGMP, SCTP, EAPOL, …) had `protocol=None`.
+* **Fix:** the `protocol` column now comes from `_get_protocol()`, in three steps:
+  1. A list of explicitly checked protocols: TCP, UDP, ICMP, ICMPv6, SCTP, GRE, ESP, AH, VRRP, ARP, EAPOL, STP, PPPoE.
+  2. Otherwise, the name of the protocol number in the packet's own headers: the IP protocol number (with IPv6 extension headers skipped), or for non-IP frames the EtherType (inside the VLAN tag if there is one). Names come from scapy's tables, e.g. 2 → `IGMP`, 0x88cc → `LLDP`.
+  3. Otherwise, `None`.
+* **Result:** no packet in the test pcaps is labeled `None` any more. Before, 80 in `netflix.pcap` and 80 in `nestcam_live.pcap` were.
+
+### Bug fixes
+
+* **Several pcaps in `netml learn` crashed (`np.concatenate` shape mismatch).** Each pcap chose its own split interval and feature length from its own flows. Now all pcaps share one interval and one feature length, computed from all of their flows.
+* **`netml classify` crashed on any pcap except the training pcap** (`X has 12 features, but OCSVM is expecting 51`). The extraction settings are now saved with the model and reused by `classify`.
+* **`netml classify` crashed when printing results.** scapy 2.5 stores packet times as `EDecimal`, which `datetime.fromtimestamp` rejects; times are now converted with `float(...)`.
+* **`netml learn train -f FILE` emptied FILE before reading it.** Also, any `learn` run that failed, even on a bad option, emptied existing `-f` and `-o` files. Both are now plain paths, opened only when their data is ready.
+* **The last subflow of every split flow was dropped**, both after timeout splitting (`_pcap2flows()`) and after interval splitting (`_flows2subflows()`). It is now kept. As for every subflow, it is dropped only if it has fewer than `flow_pkts_thres` packets.
+* **TCP vs UDP was decided with `6 in fid` / `17 in fid`**, which also matches a *port* of 6 or 17. For example, a UDP flow with port 6 got the TCP timeout. The protocol field `fid[4]` is used now.
+* **`pcap2flows(interval=X)` with `X > 0` made `flow2features()` crash**, because `q_interval` was never set.
+* **`_pcap2flows()` did not close the pcap file** (`ResourceWarning`).
+
+### Other changes
+
+**New API in `pparser`**
+
+* `PCAP.extract_flows()` and `PCAP.split_flows(interval)` are the two steps of `pcap2flows()`, which still works as before.
+* `get_shared_interval(pcaps, q_interval)` and `get_shared_pkts_dim(pcaps, q_interval)` compute settings shared by several `PCAP` objects.
+* `PCAP.flow2features(..., pkts_dim=None, sampling_rate=None)` accepts a fixed feature length and `SAMP_*` window; by default both are computed from the pcap, as before.
+* Settings used are kept on the object as `pcap.interval`, `pcap.pkts_dim` and `pcap.sampling_rate`.
+
+**Saved settings**
+
+* The CLI saves its extraction settings (`feat_type`, `q_interval`, `interval`, `pkts_dim`) in two places:
+  * in the features file, as the `.params` of a `FeatureData` (`src/netml/utils/tool.py`);
+  * on the model, as `model.extraction_params`.
+* Both files still unpack as before: `(features, labels) = load_data(...)` and `(model, history) = load_data(...)`.
+* Files saved by older versions still load. For a model without saved settings, `classify` takes the feature length from the model (`n_features_in_`), prints a warning, and computes the interval from the pcap.
+
+**Changes that affect results**
+
+* Feature values change for truncated pcaps, because sizes are now real sizes.
+* Flow counts change for pcaps with IPv6 traffic, with flows that were split, or (in the CLI) when several pcaps are given together.
+* For example, `examples/data/…/srcIP_10.42.0.1_normal.pcap` gave 4979 flows on its own before. Together with the anomaly pcap it now gives 5348.
+* The expected counts in `tests/cli_tests/test_learn.py` were updated, and each new count was checked against an independent implementation of the splitting rules.
+* With a single pcap, the CLI still uses that pcap's own settings, as before; only the fixes above change its results.
+
+**Performance**
+
+Measured on `http.pcap` and `netflix.pcap` against the previous version:
+
+* `pcap2pandas()` and `_pcap2flows()` are about 1–5% faster.
+* The size-based features are 80–97% faster, because `pkt.wirelen` is a stored number while `len(pkt)` rebuilds the packet.
+* `_get_header_features()` takes 0.119 s instead of 0.097 s on `http.pcap`. Generic layer lookup costs more than fixed positions, but a later optimization recovered most of it.
+* The full pcap → features pipeline time is unchanged within noise.
+
+**Tests**
+
+* `test_my_changes.py` (repository root) covers all the above: synthetic pcaps with exact expected values, plus real pcaps.
+  * Run it with `python test_my_changes.py`, or `python test_my_changes.py SyntheticTests` for the fast tests only.
+  * The real-pcap tests look for data in `/home/frank/ml-systems/docs/notebooks/data/` and are skipped if it is missing.
+* Run the CLI tests with `python -m unittest discover -s tests -t .`. They need the `cli` extras: `pip install -e .[cli]`.
+
+### Known limitations (not changed)
+
+* **`interval` is an idle-time threshold, not a window length.** A flow is split only where two consecutive packets are more than `interval` seconds apart, so a steady long flow stays one subflow.
+* **Features are not scaled** before modeling. A scaler would have to be fit on the training data and saved with the model, like the extraction settings.
+* **Fallback protocol names come from the OS.** scapy loads its tables from `/etc/protocols` and `/etc/ethertypes`, so on systems without them, step 2 of the protocol labeling finds fewer names.
+* **Private scapy classes:** `_ICMPv6` and `_IPv6ExtHdr` are imported from scapy and may change in a future scapy release.
+* **`--q-interval` has no effect in `classify`** when the model has saved settings; the training values are used.
+* **An unwritable `-f` / `-o` path is reported only at the end of a run**, when the file is written.
+
+
+## Design decisions (November 2026)
+
+Each decision lists the choice made, the main alternatives, and their pros and cons.
+
+### 1. Packet size: `pkt.wirelen`, falling back to `len(pkt)`
+
+* **Chosen: original (wire) length.**
+  * Pros: real packet sizes, matching Wireshark; it is a stored number, so it is also faster.
+  * Cons: features change for truncated pcaps, compared with earlier versions.
+* **Alternative: keep `len(pkt)` (captured bytes).**
+  * Pros: no change in results.
+  * Cons: sizes are capped at the snapshot length, so size features are wrong for truncated captures.
+* **Alternative: keep both (e.g. a `caplen` column next to `length`).**
+  * Pros: no information lost.
+  * Cons: a wider DataFrame, and every feature function must still pick one.
+
+### 2. IPv6: IPv4 or IPv6 layer, with the IPv6 hop limit standing in for the TTL
+
+* **Chosen: `_get_ip_layer` returns the IPv4 layer if there is one, else the IPv6 layer. The hop limit is used as the TTL.**
+  * Pros: one code path for both versions, and the hop limit means the same as the TTL.
+  * Cons: in IPv6-in-IPv4 tunnels, the *outer* IPv4 header is used.
+* **Alternative: separate IPv6 features or columns.**
+  * Pros: nothing is mixed.
+  * Cons: more columns and feature types, and models would see different feature sets for the same traffic.
+
+### 3. Protocol labels: explicit list, then protocol number, then `None`
+
+* **Chosen: explicit `if`/`elif` list → name of the IP protocol number or EtherType → `None`.**
+  * Pros: well-known protocols get clear names, and new or undecoded protocols are still named from their number.
+  * Cons: names from step 2 depend on OS files.
+* **Alternative: only an explicit list.**
+  * Pros: fully controlled names.
+  * Cons: every new protocol needs a code change, and anything missing is `None`.
+* **Alternative: only protocol numbers.**
+  * Pros: covers everything.
+  * Cons: less readable names (e.g. `IPV6_ICMP`), and no names at all without the OS tables.
+* **Alternative: also store the full layer stack and raw numbers (`layers`, `ip_proto`, `ethertype` columns).**
+  * Pros: maximal detail.
+  * Cons: a wider DataFrame. It is still possible as a future addition.
+
+**Order of the list:** TCP and UDP are checked first, so tunneled TCP/UDP (e.g. over GRE) is labeled by the *inner* protocol, as before.
+
+* Pros: no change for existing data.
+* Cons: `protocol` describes the inner packet while `ip_src` / `ip_dst` describe the outer one. Labeling by the outer header (`GRE`) would be consistent, but would change existing labels.
+
+### 4. Several pcaps in the CLI: one shared split interval and feature length
+
+* **Chosen: compute both from all flows of all input pcaps, and save them with the model.**
+  * Pros:
+    * features from different pcaps are comparable and can be concatenated;
+    * `classify` extracts features exactly as in training;
+    * it works for unlabeled input;
+    * it matches how `learn` trains, on all flows with labels unused.
+  * Cons:
+    * flow counts change;
+    * the larger class dominates the quantiles. With labeled normal/abnormal pcaps, normal traffic sets the values, and abnormal flows with more packets than the shared feature length are cut off;
+    * the quantiles also include the flows later held out for testing. This is a mild leak, of a single quantile.
+* **Alternative: per-pcap settings (the old behavior).**
+  * Pros: no change.
+  * Cons:
+    * crashes when lengths differ;
+    * features are not comparable across pcaps;
+    * with one pcap per class, the extraction step encodes the label;
+    * cannot be reproduced in `classify`, where the label is unknown.
+* **Alternative: only pad or truncate to a common length.**
+  * Pros: fixes the crash with minimal change.
+  * Cons: the split intervals still differ per pcap.
+* **Alternative: compute the settings from normal-labeled flows only.**
+  * Pros: stricter for anomaly detection, where normal traffic is the reference.
+  * Cons: needs labels before splitting, which changes the pipeline order; unlabeled input needs a fallback.
+
+### 5. Where the settings are saved: `FeatureData.params` and `model.extraction_params`
+
+* **Chosen: a `tuple` subclass for the features file, and an attribute on the model.**
+  * Pros: existing `(features, labels)` and `(model, history)` unpacking keeps working, and old files still load.
+  * Cons: the settings are "hidden" in attributes, and a `FeatureData` file needs `netml` installed to load.
+* **Alternative: add a third element to the saved tuples.**
+  * Pros: explicit.
+  * Cons: breaks every existing `a, b = load_data(...)`, including user code and the README examples.
+* **Alternative: store the settings in the training `history` dict.**
+  * Pros: no new structures.
+  * Cons: `history` is documented as empty when there is no test split.
+* **Alternative: a separate settings file next to the model.**
+  * Pros: human-readable.
+  * Cons: one more file to keep with each model.
+
+### 6. `-f` / `-o`: paths opened late, not `argparse.FileType`
+
+* **Chosen: plain paths.** Features are written after extraction succeeds and the model after training succeeds; extract and train in one run pass the data in memory.
+  * Pros: input files are never emptied, failed runs leave existing files intact, and the temporary pickle round-trip is gone.
+  * Cons: an unwritable path is reported at the end of a run instead of immediately.
+* **Alternative: keep `FileType` and choose the mode by action.**
+  * Not possible: argparse opens the file before the action is known.
+* **Alternative: open in `r+b` mode.**
+  * Pros: no truncation on open.
+  * Cons: rewriting needs explicit truncation, and failed runs can still leave partial files.
+
+### 7. Flow splitting: keep the last subflow; keep the meaning of `interval`
+
+* **Chosen: always keep the last subflow, and filter it by `flow_pkts_thres` like the others.**
+  * Pros: no packets are lost, and a flow is kept or dropped by the same rule whether or not it was split.
+  * Cons: flow counts change compared with earlier versions.
+* **Alternative: keep dropping it.** This may have been meant to avoid incomplete windows, but unsplit flows were never treated that way.
+  * Pros: no change.
+  * Cons: silently loses data, and inconsistently.
+* **Not changed: `interval` stays an idle-time threshold.** Switching to fixed-length windows would be a separate design change in what the features mean.
+
+### 8. Updating the expected counts in `tests/`
+
+* **Chosen: update the hardcoded flow counts in `tests/cli_tests/test_learn.py`** to the new behavior, checked against an independent implementation of the splitting rules, with a comment on each.
+  * Pros: the tests describe the fixed behavior.
+  * Cons: the counts no longer match those of older releases.
+* **Alternative: make the tests check properties instead** (e.g. "normal labels come first") instead of exact counts.
+  * Pros: more robust to future changes.
+  * Cons: weaker, because they could miss lost or extra flows.
+
+### 9. Header features: generic layer lookup, then optimized
+
+* **Chosen: find the TCP and IP layers by type (`pkt.getlayer`), once per layer, and count TCP flags as bits of the flags field per flow.**
+  * Pros: correct on every tested packet layout, and about twice as fast as the first generic version.
+  * Cons: still slower than reading fixed positions (0.119 s vs 0.097 s on `http.pcap`).
+* **Alternative: fixed positions (`pkt.payload…`, the old code).**
+  * Pros: fastest.
+  * Cons: crashes on IPv6 and raw-IP captures, and silently wrong on VLAN frames.
+
+### 10. ICMPv6 and IPv6 extension headers: scapy's base classes
+
+* **Chosen: check for the private scapy base classes `_ICMPv6` and `_IPv6ExtHdr`.**
+  * Pros: one check covers every ICMPv6 message type and extension header scapy knows.
+  * Cons: these are internal to scapy and could change in a future version.
+* **Alternative: list the public classes** (`ICMPv6EchoRequest`, `ICMPv6ND_NS`, …).
+  * Pros: public API only.
+  * Cons: a long list that misses types added later.
+* **Alternative: use protocol numbers** (58 for ICMPv6, plus the extension-header numbers).
+  * Pros: independent of scapy's classes.
+  * Cons: does not use what scapy already decoded.
+
+
 ## To Do
 
 Further work includes:
 
-- Evaluate `pparser` performance on different pcaps
-- Add test cases
+- Evaluate `pparser` performance on different pcaps\
+(November 2026: results checked on 8 real pcaps and on synthetic pcaps covering IPv6, VLAN, raw-IP and Linux "cooked" captures; runtime compared on `http.pcap` and `netflix.pcap`. Still to do: other capture types, e.g. pcapng and 802.11.)
+- Add test cases\
+(November 2026: `test_my_changes.py` covers the [changes above](#changes-november-2026). Still to do:
+  - move it into `tests/`, so that `tox` runs it;
+  - replace the real pcaps it reads from outside the repository with small ones in `examples/data/`;
+  - use smaller pcaps to speed up `tests/cli_tests`.)
 - Add examples
 - Add (generated) docs
+- Feature extraction:
+  - scale features: fit a scaler on the training data and save it with the model, like the extraction settings;
+  - choose the feature type in the CLI (`--feature-type`, `--fft`, `--header`); only `IAT` is extracted now;
+  - offer fixed-length time windows as an alternative to the idle-time `interval` split (see [design decision 7](#7-flow-splitting-keep-the-last-subflow-keep-the-meaning-of-interval));
+  - optionally compute the shared extraction settings from normal-labeled flows only (see [design decision 4](#4-several-pcaps-in-the-cli-one-shared-split-interval-and-feature-length)).
+- `pcap2pandas()`: optional `layers`, `ip_proto` and `ethertype` columns; an option to label tunneled packets by their outer protocol (see [design decision 3](#3-protocol-labels-explicit-list-then-protocol-number-then-none)).
+- CLI:
+  - a separate `learn test` action;
+  - a clear error for invalid model files;
+  - check that `-f` / `-o` paths are writable before a run starts;
+  - less verbose library output at the default verbosity;
+  - see also the `TODO` comments in `src/netml/cli.py`.
 
 We welcome any comments to make this tool more robust and easier to use!
 

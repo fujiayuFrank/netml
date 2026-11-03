@@ -6,9 +6,9 @@ import functools
 import importlib
 import inspect
 import itertools
+import pathlib
 import pkgutil
 import sys
-import tempfile
 import textwrap
 
 import argcmdr
@@ -22,7 +22,7 @@ from plumbum import colors
 import netml.ndm
 import netml.ndm.model
 import netml.pparser.parser
-from netml.utils.tool import dump_data, load_data, ManualDependencyError
+from netml.utils.tool import dump_data, load_data, FeatureData, ManualDependencyError
 
 
 # TODO: (sub)-command to quickly/easily get command-line completion?
@@ -69,31 +69,105 @@ binary_input_file_type_stdin = functools.partial(binary_input_file_type, allow_s
 
 class Command(argcmdr.Command):
 
-    def extract(self, pcap_file, label=None, label_file=None):
-        """Parse PCAP file and extract its flows and features.
+    # feature type extracted from flows
+    # TODO: support specification of remaining feature types
+    feat_type = 'IAT'
+
+    def extract_pcaps(self, pcap_file_labels, params=None):
+        """Parse PCAP files and extract their flows and features, with shared settings.
+
+        All pcaps are split into subflows with one interval, and their features are fixed to one
+        length, so features from different pcaps are comparable (and can be concatenated). These
+        settings are computed from the flows of all the given pcaps, unless they are given in
+        "params" (e.g. the settings a model was trained with).
 
         Labels, for model-testing, are applied if specified.
 
+        Parameters
+        ----------
+        pcap_file_labels: iterable of (pcap_file, label_kwargs)
+            label_kwargs: dict with optional "label" or "label_file" (see PCAP.label_flows)
+
+        params: dict (default is None)
+            optional "feat_type", "interval" and "pkts_dim"; missing or None values are computed
+
+        Returns
+        -------
+        (pcaps, params): the PCAP objects, and the settings used (dict)
+
         """
-        pcap = netml.pparser.parser.PCAP(
-            pcap_file,
-            flow_ptks_thres=self.args.flow_pkts_threshold,
-            verbose=self.args.verbosity,
-            random_state=self.args.random_state,
-        )
+        params = dict(params or {})
+        q_interval = params.get('q_interval', self.args.q_interval)
+        feat_type = params.get('feat_type', self.feat_type)
 
-        # extract flows from pcap
-        pcap.pcap2flows(q_interval=self.args.q_interval)
+        # 1. extract whole flows from every pcap
+        pcaps = []
+        pcap_label_kwargs = []
+        for (pcap_file, label_kwargs) in pcap_file_labels:
+            pcap = netml.pparser.parser.PCAP(
+                pcap_file,
+                flow_ptks_thres=self.args.flow_pkts_threshold,
+                verbose=self.args.verbosity,
+                random_state=self.args.random_state,
+            )
+            pcap.extract_flows()
+            pcaps.append(pcap)
+            pcap_label_kwargs.append(label_kwargs)
 
-        # label each flow
-        if label is not None or label_file is not None:
-            pcap.label_flows(label_file=label_file, label=label)
+        # 2. split them into subflows with one shared interval
+        interval = params.get('interval')
+        if interval is None:
+            interval = netml.pparser.parser.get_shared_interval(pcaps, q_interval)
 
-        # extract features from each flow given feat_type
-        # TODO: support specification of remaining feature types
-        pcap.flow2features('IAT', fft=False, header=False)
+        for (pcap, label_kwargs) in zip(pcaps, pcap_label_kwargs):
+            pcap.split_flows(interval)
+            pcap.raw_flows = None  # not needed anymore
 
-        return pcap
+            # label each flow
+            label = label_kwargs.get('label')
+            label_file = label_kwargs.get('label_file')
+            if label is not None or label_file is not None:
+                pcap.label_flows(label_file=label_file, label=label)
+
+        # 3. extract features with one shared feature length
+        pkts_dim = params.get('pkts_dim')
+        if pkts_dim is None:
+            pkts_dim = netml.pparser.parser.get_shared_pkts_dim(pcaps, q_interval)
+
+        for pcap in pcaps:
+            pcap.flow2features(feat_type, fft=False, header=False, pkts_dim=pkts_dim)
+
+        params_used = {
+            'feat_type': feat_type,
+            'q_interval': q_interval,
+            'interval': float(interval),
+            'pkts_dim': int(pkts_dim),
+        }
+        return (pcaps, params_used)
+
+    @staticmethod
+    def get_model_params(model):
+        """Get the extraction settings a model was trained with (see Learn.perform_train).
+
+        Models saved by older versions of netml have no settings: then the feature length is
+        taken from the model itself (if it records it), and the split interval from the pcap.
+
+        """
+        params = getattr(model, 'extraction_params', None)
+        if params is not None:
+            return params
+
+        print("warning: the model file has no saved feature-extraction settings "
+              "(it was made by an older version of netml); "
+              "the flow split interval is computed from this pcap instead",
+              file=sys.stderr)
+
+        n_features = getattr(model, 'n_features_in_', None)
+        if n_features is None:
+            return None
+
+        # the CLI extracts IAT features, which have pkts_dim - 1 values
+        return {'pkts_dim': n_features + 1}
 
     def vprint(self, level, *args, **kwargs):
         """Print IFF verbosity level meets or exceeds `level`."""
@@ -194,10 +268,12 @@ class Classify(Command):
 
             pcap_file = sys.stdin.buffer
 
-        pcap = self.extract(pcap_file)
-
         # TODO: catch model file issues such as EOFError
         (model, train_history) = load_data(args.model)
+
+        # extract features with the same settings the model was trained with
+        ((pcap,), _params) = self.extract_pcaps([(pcap_file, {})],
+                                                params=self.get_model_params(model))
 
         classifications = model.predict(pcap.features)
 
@@ -223,7 +299,7 @@ class Classify(Command):
                 packet_type = '[protocol-other]'
 
             (packet_datetime0, packet_datetime1) = packet_datetimes = [
-                datetime.datetime.fromtimestamp(packet.time)
+                datetime.datetime.fromtimestamp(float(packet.time))
                 for packet in (flow_packets[0], flow_packets[-1])
             ]
             packet_date = packet_datetime0.date()
@@ -242,8 +318,6 @@ class Classify(Command):
 @Main.register
 class Learn(Command):
     """train & test anomaly-detection models"""
-
-    FEATURE_SPOOL_MAX_SIZE = 50 * 1024 ** 2  # 50 MB
 
     action_extract = 'extract'
     action_train = 'train'
@@ -309,19 +383,24 @@ class Learn(Command):
             "Specify paths at which to store extracted features and the trained model."
         )
         # TODO: support optionless output (like classify)
+        # NOTE: -f and -o are paths, not argparse.FileType: FileType opens (and so empties) the
+        # NOTE: file while parsing arguments, which destroyed the input of "train" in isolation,
+        # NOTE: and the previous output of any run that then failed. They are opened only once
+        # NOTE: their data is ready.
         feature_modeling.add_argument(
             '-f', '--feature',
             metavar='FILE',
-            type=argparse.FileType('w+b'),
+            type=pathlib.Path,
             help=f"path at which extracted features are stored "
-                 f'(required only to "{self.action_extract}" OR '
+                 f'(written by "{self.action_extract}", read by "{self.action_train}"; '
+                 f'required only to "{self.action_extract}" OR '
                  f'"{self.action_train}" *in isolation*)',
         )
         feature_modeling.add_argument(
             '-o', '--output',
             '-m', '--model',
             metavar='FILE',
-            type=argparse.FileType('wb'),
+            type=pathlib.Path,
             help="path at which to store trained model "
                  f'(required to "{self.action_train}")',
         )
@@ -403,11 +482,9 @@ class Learn(Command):
             parser.error(f'the following arguments are required to "{self.action_train}": '
                          f'-o/--output/-m/--model')
 
-        # dynamic argument defaults
-        feature_descriptor = (
-            args.feature or
-            tempfile.SpooledTemporaryFile(max_size=self.FEATURE_SPOOL_MAX_SIZE)
-        )
+        train_only = self.action_extract not in actions
+        if train_only and not args.feature.is_file():
+            parser.error(f'features file not found: {args.feature}')
 
         # actions
         with contextlib.ExitStack() as stack:
@@ -418,13 +495,8 @@ class Learn(Command):
                 args.pcap_normal or (),
                 args.pcap_abnormal or (),
                 args.label or (),
-                (
-                    feature_descriptor,
-                    args.output,
-                )
             ):
-                if file_descriptor:
-                    stack.enter_context(file_descriptor)
+                stack.enter_context(file_descriptor)
 
             # extract
             if self.action_extract in actions:
@@ -437,61 +509,62 @@ class Learn(Command):
                 pcaps_abnormal = args.pcap_abnormal or ()
                 labels_abnormal = ({'label': LABEL_ABNORMAL} for _count in itertools.count())
 
-                self.perform_extract(
+                feature_data = self.perform_extract(
                     itertools.chain(
                         zip(pcaps, labels),
                         zip(pcaps_normal, labels_normal),
                         zip(pcaps_abnormal, labels_abnormal),
                     ),
-                    feature_descriptor,
                 )
 
-            # train
-            if self.action_train in actions:
-                self.perform_train(
-                    feature_descriptor,
-                    args.output,
-                )
-
-    def perform_extract(self, pcap_file_labels, feature_file):
-        pcaps = [
-            self.extract(pcap_file, **label_kwargs)
-            for (pcap_file, label_kwargs) in pcap_file_labels
-        ]
-
-        pcap_count = len(pcaps)
-        if pcap_count == 1:
-            (pcap,) = pcaps
-            (features, labels) = (pcap.features, pcap.labels)
-        elif pcap_count > 1:
-            # TODO: ensure that there is no normalization issue or other issue
-            # TODO: with simply concatenating features this way
-            #
-            # (If that is the case, can perhaps merge data prior to generating features.
-            # Iff concatenation is moved into PCAP class -- in an __add__ or otherwise --
-            # and merge must occur before feature generation, then some guards and/or
-            # refactoring might be necessary. Note that merge might make sense at packet
-            # level or with flows.)
-            features = np.concatenate([pcap.features for pcap in pcaps])
-
-            if any(pcap.labels is None for pcap in pcaps):
-                labels = None
+                # written only now that extraction succeeded
+                if args.feature:
+                    dump_data(feature_data, out_file=args.feature)
             else:
-                labels = np.concatenate([pcap.labels for pcap in pcaps])
-        else:
+                feature_data = load_data(args.feature)
+
+            # train (on the features in memory: no need to re-read them from the file)
+            if self.action_train in actions:
+                self.perform_train(feature_data, args.output)
+
+    def perform_extract(self, pcap_file_labels):
+        """Extract features (and labels, if any) from the pcaps.
+
+        Returns a FeatureData: unpacks as a plain (features, labels) pair, and also carries the
+        extraction settings in .params.
+
+        """
+        # all pcaps share one split interval and one feature length (see extract_pcaps), so
+        # their features are comparable and can simply be concatenated.
+        #
+        # NOTE: features are not scaled/normalized; a scaler would have to be fit on the training
+        # NOTE: data and saved with the model, like the extraction settings.
+        (pcaps, params) = self.extract_pcaps(pcap_file_labels)
+
+        if not pcaps:
             raise ValueError("nothing to extract")
 
-        # NOTE: SpooledTemporaryFile is a useful (internal) interface, and which keeps data in
-        # NOTE: memory until it's large enough that it "should" be written to disk. Its performance
-        # NOTE: is *likely* sufficient; but, this *could* be replaced with a slightly more complex
-        # NOTE: handling, so as to avoid (de)-serialization of the pickle when it's not required.
-        dump_data((features, labels), out_file=feature_file)
+        features = np.concatenate([pcap.features for pcap in pcaps])
 
-        # for next step (if any):
-        feature_file.seek(0)
+        if any(pcap.labels is None for pcap in pcaps):
+            labels = None
+        else:
+            labels = np.concatenate([pcap.labels for pcap in pcaps])
 
-    def perform_train(self, feature_file, output_file):
-        (features, labels) = load_data(feature_file)
+        self.vprint(2, f'feature-extraction settings: {params}')
+
+        return FeatureData(features, labels, params)
+
+    def perform_train(self, feature_data, output_path):
+        """Train (and test, if labeled) a model, and save it to output_path.
+
+        feature_data: a FeatureData, or a plain (features, labels) pair from older netml versions.
+
+        """
+        (features, labels) = feature_data
+
+        # feature files saved by older versions of netml are plain tuples without settings
+        extraction_params = getattr(feature_data, 'params', None)
 
         # train (and test split)
         #
@@ -552,6 +625,9 @@ class Learn(Command):
             **params
         )
         model.name = self.args.algorithm  # FIXME
+
+        # saved with the model, so "classify" extracts features the same way
+        model.extraction_params = extraction_params
         ndm = netml.ndm.model.MODEL(
             model,
             score_metric='auc',
@@ -571,7 +647,8 @@ class Learn(Command):
             time_test = None
 
         # dump data to disk
-        dump_data((model, ndm.history), out_file=output_file)
+        # written only now that training succeeded
+        dump_data((model, ndm.history), out_file=output_path)
 
         self.vtable(1, [
             ('train time (m)', 'test time (m)', 'model score (auc)'),

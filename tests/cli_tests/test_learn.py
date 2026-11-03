@@ -125,7 +125,11 @@ class TestLearnExtractPcapOnly(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 5_289)
+        # (multiple pcaps are split into subflows with one shared interval, computed from all of
+        # their flows; so a pcap can yield a different number of flows than on its own)
+        # (a flow split into subflows keeps its last subflow: these counts used to be lower,
+        # because the last subflow of every split flow was dropped)
+        self.assertEqual(len(features), 374 + 5_348)
         self.assertIsNone(labels)
 
 
@@ -145,8 +149,10 @@ class TestLearnExtractPcapLabels(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 88)
-        self.assertEqual(len(labels), 88)
+        # (a flow split into subflows keeps its last subflow: these counts used to be lower,
+        # because the last subflow of every split flow was dropped)
+        self.assertEqual(len(features), 102)
+        self.assertEqual(len(labels), 102)
 
     def test_extract_train(self):
         """extract features & labels and train & test model"""
@@ -185,8 +191,10 @@ class TestLearnExtractPcapLabels(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 176)
-        self.assertEqual(len(labels), 176)
+        # (a flow split into subflows keeps its last subflow: these counts used to be lower,
+        # because the last subflow of every split flow was dropped)
+        self.assertEqual(len(features), 2 * 102)
+        self.assertEqual(len(labels), 2 * 102)
 
     def test_extract_mismatch_length_0(self):
         """cannot specify too many label files for pcap files"""
@@ -247,14 +255,18 @@ class TestLearnExtractPcapNormalAbnormal(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 5289)
-        self.assertEqual(len(labels), 5289)
+        # (multiple pcaps are split into subflows with one shared interval, computed from all of
+        # their flows; so a pcap can yield a different number of flows than on its own)
+        # (a flow split into subflows keeps its last subflow: these counts used to be lower,
+        # because the last subflow of every split flow was dropped)
+        self.assertEqual(len(features), 5348 + 374)
+        self.assertEqual(len(labels), 5348 + 374)
 
         # 0 is normal
-        self.assertFalse(labels[:4979].any())
+        self.assertFalse(labels[:5348].any())
 
         # 1 is abnormal
-        self.assertTrue(labels[4979:].all())
+        self.assertTrue(labels[5348:].all())
 
     def test_extract_train(self):
         """extract flag-labeled features and train & test model"""
@@ -299,16 +311,20 @@ class TestLearnExtractPcapMixed(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 88 + 4979 + 310)
-        self.assertEqual(len(labels), 88 + 4979 + 310)
+        # (multiple pcaps are split into subflows with one shared interval, computed from all of
+        # their flows; so a pcap can yield a different number of flows than on its own)
+        # (a flow split into subflows keeps its last subflow: these counts used to be lower,
+        # because the last subflow of every split flow was dropped)
+        self.assertEqual(len(features), 131 + 5338 + 375)
+        self.assertEqual(len(labels), 131 + 5338 + 375)
 
         # 0 is normal; 1 is abnormal
-        self.assertTrue(labels[:88].any())
-        self.assertFalse(labels[:88].all())
+        self.assertTrue(labels[:131].any())
+        self.assertFalse(labels[:131].all())
 
-        self.assertFalse(labels[88:4979].any())
+        self.assertFalse(labels[131:5338].any())
 
-        self.assertTrue(labels[(88 + 4979):].all())
+        self.assertTrue(labels[(131 + 5338):].all())
 
     def test_extract_train(self):
         """extract file-labeled & flag-labeled features and train & test model"""
