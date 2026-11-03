@@ -10,3 +10,7 @@ dist/
 .idea
 
 .tox/
+
+# developing environment
+.vscode/
+.gitignore
