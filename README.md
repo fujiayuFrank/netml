@@ -563,6 +563,8 @@ Development tasks are then managed via [`argcmdr`](https://github.com/dssg/argcm
 This work was authored by Kun Yang under the direction of Professor Samory
 Kpotufe at Columbia University.
 
+The November 2026 modifications are intended to address several limitations of the original `netml`: incorrect packet sizes for truncated captures, missing IPv6 support, unlabeled protocols in `pcap2pandas()`, and several bugs in flow splitting and in the CLI. They were made with the assistance of [Claude](https://www.anthropic.com/claude) (Anthropic), through Claude Code. See [Changes (November 2026)](#changes-november-2026) and [Design decisions (November 2026)](#design-decisions-november-2026).
+
 
 ## Citation
 
