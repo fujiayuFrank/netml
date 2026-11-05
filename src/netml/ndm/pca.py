@@ -9,6 +9,8 @@ from pyod.models.base import BaseDetector
 from pyod.models.pca import PCA as _PCA
 from sklearn.utils.validation import check_array
 
+from netml.ndm.model import fit_threshold
+
 
 class PCA(BaseDetector):
 
@@ -55,8 +57,8 @@ class PCA(BaseDetector):
 
         standardization : bool, optional (default=True)
             If True, perform standardization first to convert
-            data to zero mean and unit variance.
-            See http://scikit-learn.org/stable/auto_examples/preprocessing/plot_scaling_importance.html
+            data to zero mean and unit variance. See
+            http://scikit-learn.org/stable/auto_examples/preprocessing/plot_scaling_importance.html
 
         """
         self.n_components = n_components
@@ -103,7 +105,9 @@ class PCA(BaseDetector):
 
         self.model_.fit(X_train)
 
-        # self._process_decision_scores()
+        # decision threshold, needed by predict() (see netml.ndm.model.fit_threshold)
+        fit_threshold(self, X_train)
+
         return self
 
     def decision_function(self, X):

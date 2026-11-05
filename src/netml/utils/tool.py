@@ -46,7 +46,8 @@ def dump_data(data, out_file, verbose=True):
         out file
 
     verbose: bool (default True)
-        a print level is to control what information should be printed according to the given value.
+        a print level is to control what information should be printed according to the given
+        value.
         The higher the value is, the more info is printed.
 
     Returns

@@ -34,8 +34,9 @@ from netml.utils.tool import dump_data, load_data, FeatureData, ManualDependency
 LABEL_NORMAL = 0
 LABEL_ABNORMAL = 1
 
-CLASS_NORMAL = 1
-CLASS_ABNORMAL = -1
+
+class NoFlowsError(ValueError):
+    """None of the given pcaps has a flow to extract features from."""
 
 
 # interface for setup.py
@@ -63,6 +64,56 @@ def binary_input_file_type(value, allow_stdin=False):
 
 
 binary_input_file_type_stdin = functools.partial(binary_input_file_type, allow_stdin=True)
+
+
+def _pcap_name(pcap_file):
+    """Name of a pcap (a path, or an open file such as standard input) for messages."""
+    return str(getattr(pcap_file, 'name', pcap_file))
+
+
+PARAM_FILE_SUFFIXES = ('.yaml', '.yml', '.json')
+
+# expected fraction of anomalies (see Learn: --contamination)
+DEFAULT_CONTAMINATION = 0.1
+
+# model parameter that holds the expected fraction of anomalies, by order of preference
+CONTAMINATION_PARAMS = ('contamination', 'nu')
+
+
+def param_mapping(value):
+    """Parse --param: YAML/JSON text, or the path to a YAML/JSON file, giving a mapping (dict).
+
+    JSON is valid YAML, so both are read by the YAML parser.
+
+    """
+    path = pathlib.Path(value)
+    try:
+        is_file = path.is_file()
+    except OSError:  # e.g. text too long to be a file name
+        is_file = False
+
+    if is_file:
+        text = path.read_text()
+    elif path.suffix.lower() in PARAM_FILE_SUFFIXES:
+        raise argparse.ArgumentTypeError(f'file not found: {value}')
+    else:
+        text = value
+
+    try:
+        params = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise argparse.ArgumentTypeError(f'invalid YAML/JSON: {exc}')
+
+    if params is None:
+        return {}
+
+    if not isinstance(params, dict):
+        raise argparse.ArgumentTypeError(
+            f"must be a mapping of parameter names to values, e.g. '{{nu: 0.1}}' or "
+            f"'{{ocsvm: {{nu: 0.1}}}}' (or the path to a file with one), not: {value}"
+        )
+
+    return params
 
 
 # base command class
@@ -95,24 +146,40 @@ class Command(argcmdr.Command):
         -------
         (pcaps, params): the PCAP objects, and the settings used (dict)
 
+        Pcaps left without any flow are skipped, with a warning; NoFlowsError is raised if no pcap
+        has a flow.
+
         """
         params = dict(params or {})
         q_interval = params.get('q_interval', self.args.q_interval)
         feat_type = params.get('feat_type', self.feat_type)
+        min_pkts = self.args.flow_pkts_threshold
 
         # 1. extract whole flows from every pcap
+        all_names = []
         pcaps = []
         pcap_label_kwargs = []
         for (pcap_file, label_kwargs) in pcap_file_labels:
             pcap = netml.pparser.parser.PCAP(
                 pcap_file,
-                flow_ptks_thres=self.args.flow_pkts_threshold,
+                flow_ptks_thres=min_pkts,
                 verbose=self.args.verbosity,
                 random_state=self.args.random_state,
             )
             pcap.extract_flows()
+            all_names.append(_pcap_name(pcap_file))
+
+            if not pcap.raw_flows:
+                print(f'warning: {_pcap_name(pcap_file)} has no TCP/UDP flow with at least '
+                      f'{min_pkts} packets: skipped', file=sys.stderr)
+                continue
+
             pcaps.append(pcap)
             pcap_label_kwargs.append(label_kwargs)
+
+        if not pcaps:
+            raise NoFlowsError(f'no flows to extract features from: no TCP/UDP flow with at least '
+                               f'{min_pkts} packets in {", ".join(all_names)}')
 
         # 2. split them into subflows with one shared interval
         interval = params.get('interval')
@@ -128,6 +195,17 @@ class Command(argcmdr.Command):
             label_file = label_kwargs.get('label_file')
             if label is not None or label_file is not None:
                 pcap.label_flows(label_file=label_file, label=label)
+
+        # pcaps left without flows: subflows too short, or none matched the label file
+        empty_names = [_pcap_name(pcap.pcap_file) for pcap in pcaps if not pcap.flows]
+        for name in empty_names:
+            print(f'warning: no flow of {name} is left after splitting and labeling '
+                  '(see any warning above): skipped', file=sys.stderr)
+        pcaps = [pcap for pcap in pcaps if pcap.flows]
+
+        if not pcaps:
+            raise NoFlowsError(f'no flows to extract features from: none is left after splitting '
+                               f'and labeling, in {", ".join(all_names)}')
 
         # 3. extract features with one shared feature length
         pkts_dim = params.get('pkts_dim')
@@ -272,13 +350,24 @@ class Classify(Command):
         (model, train_history) = load_data(args.model)
 
         # extract features with the same settings the model was trained with
-        ((pcap,), _params) = self.extract_pcaps([(pcap_file, {})],
-                                                params=self.get_model_params(model))
+        try:
+            ((pcap,), _params) = self.extract_pcaps([(pcap_file, {})],
+                                                    params=self.get_model_params(model))
+        except NoFlowsError as exc:
+            # not an error for classify: there is simply nothing to report
+            print(f'warning: {exc}; nothing to classify', file=sys.stderr)
+            return
 
-        classifications = model.predict(pcap.features)
+        # True where the model flags an anomaly (whichever convention the model's predict() has)
+        try:
+            is_anomaly = netml.ndm.model.predict_anomalies(model, pcap.features)
+        except ValueError as exc:
+            parser.error(str(exc))
 
-        for ((flow_key, flow_packets), classification) in zip(pcap.flows, classifications):
-            if classification == CLASS_NORMAL:
+        for ((flow_key, flow_packets), anomaly) in zip(pcap.flows, is_anomaly):
+            if anomaly:
+                class_tag = 'ANOMALY' | colors.red | colors.bold
+            else:
                 if args.report_all is None:
                     if args.verbosity <= 1:
                         continue
@@ -286,10 +375,6 @@ class Classify(Command):
                     continue
 
                 class_tag = 'NORMAL'
-            elif classification == CLASS_ABNORMAL:
-                class_tag = 'ANOMALY' | colors.red | colors.bold
-            else:
-                class_tag = '[unclassified]'
 
             if flow_key[4] == 6:
                 packet_type = 'TCP'
@@ -423,13 +508,26 @@ class Learn(Command):
         model_params.add_argument(
             '--param',
             metavar='YAML',
-            type=yaml.safe_load,
-            help="algorithmic parameters to override defaults (YAML/JSON text or path to file)",
+            type=param_mapping,
+            help="algorithmic parameters to override defaults: YAML/JSON text, e.g. "
+                 "'{nu: 0.1}' or '{ocsvm: {nu: 0.1}, kde: {bandwidth: 2}}', or the path to a "
+                 f"{'/'.join(PARAM_FILE_SUFFIXES)} file with such text",
         )
         model_params.add_argument(
             '--help-param',
             action='store_true',
             help="show all model parameters & defaults and exit",
+        )
+        model_params.add_argument(
+            '--contamination',
+            metavar='FRACTION',
+            type=float,
+            default=None,
+            help="expected fraction of anomalies, in (0, 0.5]: classify will flag about this "
+                 "fraction of the flows similar to the training data (fewer false alarms with "
+                 "a smaller value, more anomalies caught with a larger one); sets "
+                 "'contamination' of the if, kde, gmm, pca and ae algorithms and 'nu' of ocsvm "
+                 f"(default: {DEFAULT_CONTAMINATION})",
         )
         model_params.add_argument(
             '--test-size',
@@ -461,8 +559,8 @@ class Learn(Command):
 
         # dynamic argument checks
         if (self.action_extract in actions and not args.pcap
-                                           and not args.pcap_normal
-                                           and not args.pcap_abnormal):
+                and not args.pcap_normal
+                and not args.pcap_abnormal):
             parser.error(f'at least one of the following arguments are required to '
                          f'"{self.action_extract}": -p/--pcap, --pcap-normal or --pcap-abnormal')
 
@@ -481,6 +579,10 @@ class Learn(Command):
         if self.action_train in actions and not args.output:
             parser.error(f'the following arguments are required to "{self.action_train}": '
                          f'-o/--output/-m/--model')
+
+        # checked now, rather than after a possibly long extraction
+        if self.action_train in actions:
+            self.model_params = self.check_model_params(parser)
 
         train_only = self.action_extract not in actions
         if train_only and not args.feature.is_file():
@@ -509,13 +611,16 @@ class Learn(Command):
                 pcaps_abnormal = args.pcap_abnormal or ()
                 labels_abnormal = ({'label': LABEL_ABNORMAL} for _count in itertools.count())
 
-                feature_data = self.perform_extract(
-                    itertools.chain(
-                        zip(pcaps, labels),
-                        zip(pcaps_normal, labels_normal),
-                        zip(pcaps_abnormal, labels_abnormal),
-                    ),
-                )
+                try:
+                    feature_data = self.perform_extract(
+                        itertools.chain(
+                            zip(pcaps, labels),
+                            zip(pcaps_normal, labels_normal),
+                            zip(pcaps_abnormal, labels_abnormal),
+                        ),
+                    )
+                except NoFlowsError as exc:
+                    parser.error(str(exc))
 
                 # written only now that extraction succeeded
                 if args.feature:
@@ -555,6 +660,80 @@ class Learn(Command):
 
         return FeatureData(features, labels, params)
 
+    def check_model_params(self, parser):
+        """Get the --param values for the chosen algorithm, and check them against the model.
+
+        --param may be:
+        * unspecified (None)
+        * just a dict for this model
+        * a dict with sub-dicts for several models (keys are algorithm names)
+
+        """
+        params = self.args.param or {}
+        algorithm = self.args.algorithm
+
+        is_per_algorithm = bool(params) and all(
+            key in self.train_algorithms and isinstance(value, dict)
+            for (key, value) in params.items()
+        )
+        if is_per_algorithm:
+            params = params.get(algorithm, {})
+
+        if 'random_state' in params:
+            parser.error('--param: set random_state with --random-state instead')
+
+        model_class = self.load_algorithmic_model(algorithm)
+        if isinstance(model_class, Exception):
+            parser.error(f'algorithm {algorithm} is not available: {model_class}')
+
+        accepted = [name for name in inspect.signature(model_class).parameters
+                    if name != 'random_state']
+        unknown = [name for name in params if name not in accepted]
+        if unknown:
+            parser.error(f'--param: {", ".join(map(str, unknown))} is not a parameter of '
+                         f'algorithm {algorithm}; its parameters are: {", ".join(accepted)}')
+
+        return self.add_contamination(parser, dict(params), accepted)
+
+    def add_contamination(self, parser, params, accepted):
+        """Set the model parameter holding the expected fraction of anomalies (pyod models:
+        "contamination", OCSVM: "nu") from --contamination, from --param, or to the default.
+
+        Then report the value and what it means for classify.
+
+        """
+        algorithm = self.args.algorithm
+        names = [name for name in CONTAMINATION_PARAMS if name in accepted]
+        if not names:
+            parser.error(f'algorithm {algorithm} has no parameter for the expected fraction of '
+                         'anomalies, so --contamination does not apply to it')
+        name = names[0]
+
+        if self.args.contamination is not None and name in params:
+            parser.error(f'--contamination and --param both set {name} (the expected fraction of '
+                         'anomalies): set it once')
+
+        if name in params:
+            (value, option) = (params[name], f'--param {name}')
+        elif self.args.contamination is not None:
+            (value, option) = (self.args.contamination, '--contamination')
+        else:
+            (value, option) = (DEFAULT_CONTAMINATION, '--contamination')
+
+        is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if not is_number or not 0 < value <= 0.5:
+            parser.error(f'{option} must be a fraction in (0, 0.5], not {value!r}: it is the '
+                         'expected fraction of anomalies (0 would flag almost nothing: the '
+                         'threshold would be the most anomalous training flow)')
+
+        params[name] = value
+
+        self.vprint(1, f'contamination {value:g} ({algorithm}: {name}={value:g}): classify will '
+                       f'flag about {value:.0%} of flows similar to the training data '
+                       f'(set with --contamination)')
+
+        return params
+
     def perform_train(self, feature_data, output_path):
         """Train (and test, if labeled) a model, and save it to output_path.
 
@@ -580,6 +759,12 @@ class Learn(Command):
                 ('train', features_train.shape, 'n/a'),
                 ('test', 'n/a', 'n/a'),
             ], title='data shapes')
+        elif len(np.unique(labels)) < 2:
+            print('warning: all flows have the same label (only one class): the model is trained, '
+                  'but not tested -- testing (AUC) needs both normal and abnormal flows',
+                  file=sys.stderr)
+            features_train = features
+            features_test = labels_test = _labels_train = None
         else:
             (
                 features_train,
@@ -591,33 +776,25 @@ class Learn(Command):
                                                          test_size=self.args.test_size,
                                                          random_state=self.args.random_state)
 
+            if len(np.unique(labels_test)) < 2:
+                print('warning: the test split has flows of only one class: the model is not '
+                      'tested -- testing (AUC) needs both normal and abnormal flows; try a larger '
+                      '--test-size', file=sys.stderr)
+                features_test = labels_test = None
+
             self.vtable(2, [
                 ('', 'features', 'labels'),
                 ('train', features_train.shape, 'n/a'),
-                ('test', features_test.shape, labels_test.shape),
+                ('test', getattr(features_test, 'shape', 'n/a'),
+                 getattr(labels_test, 'shape', 'n/a')),
             ], title='data shapes')
 
         self.vprint(2, f'model name: {self.args.algorithm}')
 
-        # param may be:
-        # * unspecified (None)
-        # * just a dict for this model
-        # * dict with sub-dicts for many models
-        params = self.args.param or {}
-        if isinstance(params.get(self.args.algorithm), dict):
-            params = params[self.args.algorithm]
-
+        params = self.model_params
         self.vprint(2, f'param override: {params}')
 
         model_class = self.load_algorithmic_model(self.args.algorithm)
-
-        try:
-            inspect.signature(model_class).bind(**params)
-        except TypeError as exc:
-            raise ValueError(
-                f"model-training params failed to bind for {self.args.algorithm}:\n" +
-                textwrap.indent(yaml.dump(params).strip(), '  ')
-            ) from exc
 
         # create detection model
         model = model_class(

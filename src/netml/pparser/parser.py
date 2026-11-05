@@ -5,21 +5,19 @@
 """
 import ipaddress
 import itertools
+import warnings
 from collections import OrderedDict
-from datetime import datetime
 
 import netaddr
 import numpy as np
 import pandas as pd
 
-#
-# FIXME: 'import *' bad for a number of reasons...
-#
-# For one: the below imports class 'datetime.datetime' and invalidates our import of the module.
-#
-# (So for now we'll import the class datetime.datetime as well.)
-#
-from scapy.all import *
+# scapy.all is imported for its side effect: it loads all of scapy's default protocol layers,
+# which decides how packets are dissected (e.g. which encapsulations are decoded). The names
+# used here are imported explicitly (no 'import *', which hid where names came from).
+import scapy.all  # noqa: F401
+from scapy.layers.dns import DNSQR, DNSRR
+from scapy.utils import PcapReader
 
 from scapy.data import ETHER_TYPES, IP_PROTOS
 from scapy.layers.eap import EAPOL
@@ -248,7 +246,8 @@ def _pcap2flows(pcap_file, flow_pkts_thres=2, *, tcp_timeout=600, udp_timeout=60
 
     flow_pkts_thres: int (default is 2)
         the minimum number of packets of each flow is to control which flow should be kept
-        and which one should be discarded. The default value is 2, i.e., all the flows which have less than 2 packets
+        and which one should be discarded. The default value is 2, i.e., all the flows which have
+        less than 2 packets
         are discarded. It must be >= 2.
 
     tcp_timeout: int (default is 600s)
@@ -258,7 +257,8 @@ def _pcap2flows(pcap_file, flow_pkts_thres=2, *, tcp_timeout=600, udp_timeout=60
         a timeout is to split flow
 
     verbose: int (default is 0)
-        a print level is to control what information should be printed according to the given value.
+        a print level is to control what information should be printed according to the given
+        value.
         The higher the value is, the more info is printed.
 
     Returns
@@ -270,7 +270,8 @@ def _pcap2flows(pcap_file, flow_pkts_thres=2, *, tcp_timeout=600, udp_timeout=60
     if verbose:
         print(f'pcap_file: {pcap_file}')
 
-    # store all extracted flows into a dictionary, whose key is flow id ('fid': five-tuple) and value is packtes
+    # store all extracted flows into a dictionary, whose key is flow id ('fid': five-tuple) and
+    # value is packtes
     # that belongs to the flow.
     flows = OrderedDict()
     try:
@@ -322,10 +323,12 @@ def _pcap2flows(pcap_file, flow_pkts_thres=2, *, tcp_timeout=600, udp_timeout=60
             # the protocol is the last item of the fid: "6 in fid" would also match a port number
             if fid[4] == 6:
                 # handle TCP packets, TCP is 6
-                # a timeout (the idle time) is the duration between the previous pkt and the current one.
+                # a timeout (the idle time) is the duration between the previous pkt and the
+                # current one.
                 if pkt_time - _get_frame_time(subflow_tmp[-1]) > tcp_timeout:
                     subflows.append((fid, subflow_tmp))
-                    subflow_tmp = [pkt]  # create a new subflow and store the current packet as the first packet of it.
+                    # create a new subflow and store the current packet as the first packet of it.
+                    subflow_tmp = [pkt]
                 else:
                     subflow_tmp.append(pkt)
             elif fid[4] == 17:
@@ -348,10 +351,11 @@ def _pcap2flows(pcap_file, flow_pkts_thres=2, *, tcp_timeout=600, udp_timeout=60
     if verbose > 3:
         n_lt_2 = len([len(pkts) for fid, pkts in flows.items() if len(pkts) < flow_pkts_thres])
         n_gt_2 = len([len(pkts) for fid, pkts in flows.items() if len(pkts) >= flow_pkts_thres])
-        print(f'total number of flows: {len(flows.keys())}. Num of flows < {flow_pkts_thres} pkts: {n_lt_2}, '
-              f'and >={flow_pkts_thres} pkts: {n_gt_2} without timeout splitting.')
+        print(f'total number of flows: {len(flows.keys())}. Num of flows < {flow_pkts_thres} '
+              f'pkts: {n_lt_2}, and >={flow_pkts_thres} pkts: {n_gt_2} without timeout splitting.')
         print(
-            f'kept flows: {len(new_flows)}. Each of them has at least {flow_pkts_thres} pkts after timeout splitting.')
+            f'kept flows: {len(new_flows)}. Each of them has at least {flow_pkts_thres} pkts '
+            'after timeout splitting.')
 
     return new_flows
 
@@ -369,11 +373,13 @@ def _flows2subflows(flows, interval=10, *, flow_pkts_thres=2, verbose=0):
 
     flow_ptks_thres: int (default is 2)
         the minimum number of packets of each flow is to control which flow should be kept
-        and which one should be discarded. The default value is 2, i.e., all the flows which have less than 2 packets
+        and which one should be discarded. The default value is 2, i.e., all the flows which have
+        less than 2 packets
         are discarded. It must be >= 2.
 
     verbose: int (default is 0)
-        a print level is to control what information should be printed according to the given value.
+        a print level is to control what information should be printed according to the given
+        value.
         The higher the value is, the more info is printed.
 
     Returns
@@ -402,12 +408,15 @@ def _flows2subflows(flows, interval=10, *, flow_pkts_thres=2, verbose=0):
             # the protocol is the last item of the fid: "6 in fid" would also match a port number
             if fid[4] == 6:
                 # handle TCP packets, TCP is 6
-                # a timeout (the idle time) is the duration between the previous pkt and the current one.
+                # a timeout (the idle time) is the duration between the previous pkt and the
+                # current one.
                 if pkt_time - subflow_tmp[-1][0] > interval:
                     subflows.append((fid, subflow_tmp))
-                    subflow_tmp_start_time += int((pkt_time - subflow_tmp_start_time) // interval) * interval
-                    # create a new subflow and store "subflow_tmp_start_time" as the time. Here, it will has a tiny
-                    # difference of packet time between "subflow_tmp_start_time" and the current packet time.
+                    subflow_tmp_start_time += (int((pkt_time - subflow_tmp_start_time) // interval)
+                                               * interval)
+                    # create a new subflow and store "subflow_tmp_start_time" as the time. Here,
+                    # it will has a tiny difference of packet time between
+                    # "subflow_tmp_start_time" and the current packet time.
                     subflow_tmp = [(subflow_tmp_start_time, pkt)]
                 else:
                     subflow_tmp.append((pkt_time, pkt))
@@ -416,7 +425,8 @@ def _flows2subflows(flows, interval=10, *, flow_pkts_thres=2, verbose=0):
                 # handle UDP packets, UDP is 17
                 if pkt_time - subflow_tmp[-1][0] > interval:
                     subflows.append((fid, subflow_tmp))
-                    subflow_tmp_start_time += int((pkt_time - subflow_tmp_start_time) // interval) * interval
+                    subflow_tmp_start_time += (int((pkt_time - subflow_tmp_start_time) // interval)
+                                               * interval)
                     subflow_tmp = [(subflow_tmp_start_time, pkt)]
                 else:
                     subflow_tmp.append((pkt_time, pkt))
@@ -438,8 +448,8 @@ def _flows2subflows(flows, interval=10, *, flow_pkts_thres=2, verbose=0):
 
     new_flows = subflows
     if verbose > 1:
-        print(f'After splitting flows, the number of subflows: {len(new_flows)} and each of them has at least '
-              f'{flow_pkts_thres} packets.')
+        print(f'After splitting flows, the number of subflows: {len(new_flows)} and each of them '
+              f'has at least {flow_pkts_thres} packets.')
 
     return new_flows
 
@@ -595,10 +605,12 @@ def _get_STATS(flows):
             pkts_rate = 0.0
             bytes_rate = 0.0
         else:
-            pkts_rate = num_pkts / sub_duration  # it will be very larger due to the very small sub_duration
+            # it will be very larger due to the very small sub_duration
+            pkts_rate = num_pkts / sub_duration
             bytes_rate = num_bytes / sub_duration
 
-        q1, q2, q3 = np.quantile(sizes, q=[0.25, 0.5, 0.75])  # q should be [0,1] and q2 is np.median(data)
+        # q should be [0,1] and q2 is np.median(data)
+        q1, q2, q3 = np.quantile(sizes, q=[0.25, 0.5, 0.75])
         base_features = [sub_duration, pkts_rate, bytes_rate, np.mean(sizes), np.std(sizes),
                          q1, q2, q3, np.min(sizes), np.max(sizes), num_pkts, num_bytes]
 
@@ -615,7 +627,8 @@ def _get_SAMP(flows, sampling_feature='SAMP_NUM', sampling_rate=0.1, verbose=0):
     For example, sampling_feature = 'SAMP_NUM'
         The length in time of the sub window is what we’re calling sampling rate.
            features obtained on sampling_rate = 0.1 means that:
-            1) split each flow into small windows, each window has 0.1 duration (the length in time of each small window)
+            1) split each flow into small windows, each window has 0.1 duration
+               (the length in time of each small window)
             2) obtain the number of packets from each window (0.1s).
             3) all the values obtained form each window make up of the features (SAMP_NUM).
 
@@ -675,7 +688,8 @@ def _get_SAMP(flows, sampling_feature='SAMP_NUM', sampling_rate=0.1, verbose=0):
                     num_intervals = min(num_intervals, 500)
                     each_flow_features.extend([0] * num_intervals)
                     current += num_intervals * sampling_rate
-                if len(each_flow_features) > 500:  # avoid num_features too large to excess the memory.
+                # avoid num_features too large to excess the memory.
+                if len(each_flow_features) > 500:
                     # return fid, each_flow_features[:500]
                     samp_sub = -1
                     each_flow_features = each_flow_features[:500]
@@ -704,7 +718,8 @@ def _get_SAMP_NUM(flows, sampling_rate=1):
 
      The length in time of the sub window is what we’re calling sampling rate.
         features obtained on sampling_rate = 0.1 means that:
-         1) split each flow into small windows, each window has 0.1 duration (the length in time of each small window)
+         1) split each flow into small windows, each window has 0.1 duration
+            (the length in time of each small window)
          2) obtain the number of packets from each window (0.1s).
          3) all values obtained from each window make up of the features (SAMP_NUM).
 
@@ -732,7 +747,8 @@ def _get_SAMP_SIZE(flows, sampling_rate=1):
 
      The length in time of the subwindow is what we’re calling sampling rate.
         features obtained on sampling_rate = 0.1 means that:
-         1) split each flow into small windows, each window has 0.1 duration (the length in time of each small window)
+         1) split each flow into small windows, each window has 0.1 duration
+            (the length in time of each small window)
          2) obtain the total size of packets in each window (0.1s).
          3) all the values obtained from each window make up of the features (SAMP_SIZE).
 
@@ -756,6 +772,9 @@ def _get_SAMP_SIZE(flows, sampling_rate=1):
 
 
 def _get_split_interval(flow_durations, q_interval=0.9):
+    if len(flow_durations) == 0:
+        raise ValueError('no flows: no TCP/UDP flow with at least flow_pkts_thres packets '
+                         '(default 2) in the pcap(s)')
     interval = np.quantile(flow_durations, q=q_interval)
 
     return interval
@@ -769,6 +788,9 @@ def _get_pkts_dim(flows, q_interval):
     """Number of packets per flow that features are fixed to: the q_interval quantile of the
     number of packets per flow."""
     num_pkts = [len(pkts) for fid, pkts in flows]
+    if not num_pkts:
+        raise ValueError('no flows: no TCP/UDP flow with at least flow_pkts_thres packets '
+                         '(default 2) in the pcap(s)')
     return int(np.floor(np.quantile(num_pkts, q_interval)))
 
 
@@ -828,10 +850,26 @@ def _get_FFT_data(features, fft_bin='', fft_part='real'):
     return fft_features
 
 
+def _dns_text(value):
+    """Turn a DNS name or record value from scapy into a string (or None).
+
+    scapy gives names as bytes, A/AAAA records as str, and TXT records as a list of bytes.
+    Bytes that are not valid UTF-8 (malformed or malicious packets) are replaced, not fatal.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    if isinstance(value, (list, tuple)):
+        return ' '.join(_dns_text(v) for v in value)
+    return str(value)
+
+
 class PCAP:
 
     def __init__(self, pcap_file, *, flow_ptks_thres=2, verbose=0, random_state=42):
-        """PCAP includes all processing functions of pcaps, such as pcap2flows, flow2features, and label_flows .
+        """PCAP includes all processing functions of pcaps, such as pcap2flows, flow2features,
+        and label_flows .
 
         Parameters
         ----------
@@ -840,11 +878,13 @@ class PCAP:
 
         flow_ptks_thres: int (default is 2)
             the minimum number of packets of each flow is to control which flow should be kept
-            and which one should be discarded. The default value is 2, i.e., all the flows which have less than 2 packets
+            and which one should be discarded. The default value is 2, i.e., all the flows which
+            have less than 2 packets
             are discarded. It must be >= 2.
 
         verbose: int (default is 0)
-            a print level is to control what information should be printed according to the given value.
+            a print level is to control what information should be printed according to the given
+            value.
             The higher the value is, the more info is printed.
 
         random_state: int
@@ -865,8 +905,10 @@ class PCAP:
 
     @timing
     def _pcap2flows(self, interval=0, q_interval=0.1, *, tcp_timeout=600, udp_timeout=600):
-        """Extract flows from the given pcap and split each flow to subflow by "interval" or "q_interval".
-                   It prefers to choose "interval" as the split measure if interval > 0; otherwise, use q_interval to find an interval.
+        """Extract flows from the given pcap and split each flow to subflow by "interval" or
+        "q_interval".
+                   It prefers to choose "interval" as the split measure if interval > 0; otherwise,
+                   use q_interval to find an interval.
                     q_interval must be in [0, 1]
 
         Parameters
@@ -886,7 +928,8 @@ class PCAP:
         Returns
         -------
         all flows: list
-            each element in the list represents a flow, and each flow includes 2 values: flow id (five-tuple) and packets.
+            each element in the list represents a flow, and each flow includes 2 values: flow id
+            (five-tuple) and packets.
         """
 
         # always kept: flow2features uses it for the feature dimension, even if "interval" is given
@@ -943,8 +986,10 @@ class PCAP:
                                      flow_pkts_thres=self.flow_ptks_thres, verbose=self.verbose)
 
     def pcap2flows(self, interval=0.0, q_interval=0.9, *, tcp_timeout=600, udp_timeout=600):
-        """Extract flows from the given pcap and split each flow to subflow by "interval" or "q_interval".
-           It prefers to choose "interval" as the split measure if interval > 0; otherwise, use q_interval to find an interval.
+        """Extract flows from the given pcap and split each flow to subflow by "interval" or
+        "q_interval".
+           It prefers to choose "interval" as the split measure if interval > 0; otherwise,
+           use q_interval to find an interval.
             q_interval must be in [0, 1]
 
         Parameters
@@ -964,7 +1009,8 @@ class PCAP:
         -------
             self
         """
-        _, tot_time = self._pcap2flows(interval, q_interval, tcp_timeout=tcp_timeout, udp_timeout=udp_timeout)
+        _, tot_time = self._pcap2flows(interval, q_interval, tcp_timeout=tcp_timeout,
+                                       udp_timeout=udp_timeout)
         self.pcap2flows.__dict__['tot_time'] = tot_time
 
     @timing
@@ -1020,7 +1066,8 @@ class PCAP:
             self.dim = dim - 1
             self.features, self.fids = _get_SAMP_NUM(self.flows, sampling_rate)
         elif feat_type in ['SAMP_SIZE', 'FFT-SAMP_SIZE']:
-            self.dim = dim - 1  # here the dim of "SAMP_SIZE" is dim -1, which equals to the dimension of 'SAMP_NUM'
+            # here the dim of "SAMP_SIZE" is dim -1, which equals to the dimension of 'SAMP_NUM'
+            self.dim = dim - 1
             self.features, self.fids = _get_SAMP_SIZE(self.flows, sampling_rate)
         else:
             msg = f'feat_type ({feat_type}) is not correct! '
@@ -1030,7 +1077,8 @@ class PCAP:
             self.features = _get_FFT_data(self.features, fft_bin=self.dim)
         else:
             # fix each flow to the same feature dimension (cut off the flow or append 0 to it)
-            self.features = [v[:self.dim] if len(v) > self.dim else v + [0] * (self.dim - len(v)) for v in self.features]
+            self.features = [v[:self.dim] if len(v) > self.dim else v + [0] * (self.dim - len(v))
+                             for v in self.features]
 
         if header:
             _headers = _get_header_features(self.flows)
@@ -1040,11 +1088,16 @@ class PCAP:
                 self.features = [h + f for h, f in zip(fft_headers, self.features)]
             else:
                 # fix header dimension firstly
-                headers = [h[:h_dim] if len(h) > h_dim else h + [0] * (h_dim - len(h)) for h in _headers]
+                headers = [h[:h_dim] if len(h) > h_dim else h + [0] * (h_dim - len(h))
+                           for h in _headers]
                 self.features = [h + f for h, f in zip(headers, self.features)]
 
         # change list to numpy array
         self.features = np.asarray(self.features, dtype=float)
+        if not self.flows:
+            # no flows: still a 2-D array (0 rows), so it can be concatenated with others
+            width = self.dim + (8 + self.dim if header else 0)
+            self.features = self.features.reshape(0, width)
         if self.verbose > 5:
             print(np.all(self.features >= 0))
 
@@ -1084,7 +1137,8 @@ class PCAP:
     @timing
     def _label_flows(self, label_file=None, label=0):
         """label each flow by label_file (only for CICIDS_2017 label_file) or label.
-        If you want to parse other label file, you have to override "label_flows()" with your own one.
+        If you want to parse other label file, you have to override "label_flows()" with your own
+        one.
         (normal=0,and abnormal = 1)
 
         Parameters
@@ -1114,8 +1168,9 @@ class PCAP:
                 if (self.verbose > 3) and (i % 10000 == 0):
                     print(f"Label CSV {i}th row")
                 row = csv.loc[r]
-                fid = (str(row[" Source IP"]), str(row[" Destination IP"]), int(row[" Source Port"]),
-                       int(row[" Destination Port"]), int(row[" Protocol"]))
+                fid = (str(row[" Source IP"]), str(row[" Destination IP"]),
+                       int(row[" Source Port"]), int(row[" Destination Port"]),
+                       int(row[" Protocol"]))
                 # ensure all 5-tuple flows have same label
                 label_i = row[" Label"].upper()
                 if label_i in NORMAL_LABELS:
@@ -1141,7 +1196,13 @@ class PCAP:
                     not_existed_fids.append(fid)
             if self.verbose > 3:
                 print(
-                    f'Number of labelled flows: {len(new_labels)}; number of not existed flows: {len(not_existed_fids)}')
+                    f'Number of labelled flows: {len(new_labels)}; number of not existed flows: '
+                    f'{len(not_existed_fids)}')
+
+            if self.flows and not new_flows:
+                warnings.warn(f'none of the {len(self.flows)} flows of {self.pcap_file} matched a '
+                              f'row of the label file {label_file}: all its flows are dropped; '
+                              'check that the label file belongs to this pcap')
 
             self.labels = new_labels
             self.flows = new_flows
@@ -1152,7 +1213,8 @@ class PCAP:
 
     def label_flows(self, label_file=None, label=0):
         """label each flow by label_file (only for CICIDS_2017 label_file) or label.
-        If you want to parse other label file, you have to override "label_flows()" with your own one.
+        If you want to parse other label file, you have to override "label_flows()" with your own
+        one.
         (normal=0,and abnormal = 1)
 
         Parameters
@@ -1197,8 +1259,9 @@ class PCAP:
 
             The dicts have the following key/value pairs:
 
-              "time"      : time the packet was receieved in seconds since epoch
-              "datetime"  : time the packet was received as a datetime object
+              "time"      : time the packet was received, in seconds since the epoch (float)
+              "datetime"  : time the packet was received, in nanoseconds since the epoch (int);
+                            turned into a UTC timestamp by _pcap2pandas
               "length"    : original (wire) length of packet in bytes
               "mac_src"   : source MAC address
               "mac_dst"   : destination MAC address
@@ -1209,8 +1272,8 @@ class PCAP:
               "port_src"  : source port
               "port_dst"  : destination port
               "is_dns"    : True if packet is DNS packet, else False
-              "dns_query" : string DNS query
-              "dns_resp"  : string DNS response
+              "dns_query" : DNS query name (str)
+              "dns_resp"  : DNS answer (str) of the first answer record
 
         """
         with PcapReader(self.pcap_file) as pcap_reader:
@@ -1218,8 +1281,9 @@ class PCAP:
                 pkt_dict = dict.fromkeys(self._pcap_columns)
 
                 pkt_dict.update(
-                    time=pkt.time,
-                    datetime=datetime.fromtimestamp(int(pkt.time)),
+                    time=float(pkt.time),
+                    # exact: pkt.time is a decimal number of seconds, as stored in the pcap
+                    datetime=int(pkt.time * 1_000_000_000),
                     length=_get_pkt_len(pkt),
                     is_dns=False,
                 )
@@ -1245,26 +1309,14 @@ class PCAP:
                 if (dnsqr := pkt.getlayer(DNSQR)) is not None:
                     pkt_dict.update(
                         is_dns=True,
-                        dns_query=(
-                            dnsqr.qname.decode('utf-8')
-                            if isinstance(dnsqr.qname, bytes)
-                            else dnsqr.qname,
-                        )
+                        dns_query=_dns_text(dnsqr.qname),
                     )
 
                 if (dnsrr := pkt.getlayer(DNSRR)) is not None:
                     pkt_dict.update(
                         is_dns=True,
-                        dns_query=(
-                            dnsrr.rrname.decode('utf-8')
-                            if isinstance(dnsrr.rrname, bytes)
-                            else dnsrr.rrname,
-                        ),
-                        dns_resp=(
-                            dnsrr.rdata.decode('utf-8')
-                            if isinstance(dnsrr.rdata, bytes)
-                            else dnsrr.rdata,
-                        )
+                        dns_query=_dns_text(dnsrr.rrname),
+                        dns_resp=_dns_text(dnsrr.rdata),
                     )
 
                 yield pkt_dict
@@ -1284,7 +1336,12 @@ class PCAP:
         """
         self.df = pd.DataFrame(self._iter_pcap_dict(), columns=self._pcap_columns)
 
-        self.df['datetime'] = pd.to_datetime(self.df['datetime'])
+        # float, also for an empty pcap
+        self.df['time'] = self.df['time'].astype(float)
+
+        # full precision, in UTC: the same on every machine, whatever its local time zone
+        self.df['datetime'] = pd.to_datetime(self.df['datetime'].astype('int64'), unit='ns',
+                                             utc=True)
 
         self.df['ip_dst_int'] = self.df['ip_dst'].apply(
             lambda x: None if x is None else int(ipaddress.ip_address(x)))
@@ -1298,7 +1355,10 @@ class PCAP:
         self.df['mac_src_int'] = self.df['mac_src'].apply(
             lambda x: None if x is None else int(netaddr.EUI(x)))
 
-        self.df['time_normed'] = self.df['time'].apply(lambda x: x - self.df.iloc[0]['time'])
+        # seconds since the earliest packet (packets are not always stored in time order);
+        # computed from the exact datetimes
+        time_since_start = self.df['datetime'] - self.df['datetime'].min()
+        self.df['time_normed'] = time_since_start.dt.total_seconds()
 
         self.df.sort_index(axis=1, inplace=True)
 

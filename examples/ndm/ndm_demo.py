@@ -2,6 +2,7 @@
 
 """
 import pathlib
+import sys
 
 from sklearn.model_selection import train_test_split
 
@@ -13,6 +14,7 @@ RANDOM_STATE = 42
 
 EXAMPLES_PATH = pathlib.Path(__file__).parent.parent
 
+# written by examples/pparser/pparser_demo.py
 DATA_FILE = EXAMPLES_PATH / 'out' / 'data' / 'demo_IAT.dat'
 
 
@@ -59,12 +61,18 @@ def generate_model(model_name='GMM'):
 
 
 def main(data_file=DATA_FILE):
+    data_file = pathlib.Path(data_file)
+    if not data_file.exists():
+        sys.exit(f'{data_file} not found: run examples/pparser/pparser_demo.py first, '
+                 'to extract the features this demo reads')
+
     # load data
     X, y = load_data(data_file)
     # split train and test test
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, random_state=RANDOM_STATE)
-    print(f'X_train.shape: {X_train.shape}, X_test.shape: {X_test.shape}, y_train.shape: {y_train.shape}, '
-          f'y_test.shape: {y_test.shape}')
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33,
+                                                        random_state=RANDOM_STATE)
+    print(f'X_train.shape: {X_train.shape}, X_test.shape: {X_test.shape}, '
+          f'y_train.shape: {y_train.shape}, y_test.shape: {y_test.shape}')
 
     # model_name in ['OCSVM', 'KDE','IF', 'AE', 'GMM', 'PCA']
     model_name = 'OCSVM'

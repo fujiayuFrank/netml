@@ -122,8 +122,14 @@ file to the `netml classify` command of the CLI:
 Using the Python library, the same might be accomplished, _e.g._:
 
 ```python
+from netml.ndm.model import predict_anomalies
 from netml.pparser.parser import PCAP
 from netml.utils.tool import load_data
+
+(model, train_history) = load_data('model.dat')
+
+# the feature-extraction settings saved by `netml learn`
+settings = model.extraction_params
 
 pcap = PCAP(
     'unclassified.pcap',
@@ -132,16 +138,16 @@ pcap = PCAP(
     verbose=10,
 )
 
-# extract flows from pcap
-pcap.pcap2flows(q_interval=0.9)
+# extract flows and features with the settings the model was trained with
+pcap.pcap2flows(interval=settings['interval'])
+pcap.flow2features(settings['feat_type'], fft=False, header=False, pkts_dim=settings['pkts_dim'])
 
-# extract features from each flow given feat_type
-pcap.flow2features('IAT', fft=False, header=False)
-
-(model, train_history) = load_data('model.dat')
-
-model.predict(pcap.features)
+# True for the flows the model flags as anomalies (the same convention for every model)
+is_anomaly = predict_anomalies(model, pcap.features)
 ```
+
+(`model.predict()` also works, but its output depends on the model: the OCSVM model returns 1 for
+normal and -1 for anomalies, the other models 0 for normal and 1 for anomalies.)
 
 ### Training a network traffic model
 
@@ -322,6 +328,89 @@ This section lists the fixes and changes made to `pparser` (`src/netml/pparser/p
 * **TCP vs UDP was decided with `6 in fid` / `17 in fid`**, which also matches a *port* of 6 or 17. For example, a UDP flow with port 6 got the TCP timeout. The protocol field `fid[4]` is used now.
 * **`pcap2flows(interval=X)` with `X > 0` made `flow2features()` crash**, because `q_interval` was never set.
 * **`_pcap2flows()` did not close the pcap file** (`ResourceWarning`).
+* **`pcap2pandas()`: the DNS columns held 1-element tuples, and could crash.**
+  * **Problem:** `dns_query` / `dns_resp` were tuples such as `('example.com.',)`, because of a trailing comma in the code. A DNS name that was not valid UTF-8 (a malformed packet) made the whole parse fail with `UnicodeDecodeError`.
+  * **Fix:** both columns are now plain strings (helper `_dns_text`). TXT records, which scapy gives as a list of byte strings, are joined with spaces. Invalid UTF-8 bytes are replaced with `�` instead of failing.
+* **`pcap2pandas()`: the time columns were imprecise, machine-dependent and slow.**
+  * **Problem:**
+    * `time` held scapy `EDecimal` objects in an `object` column, so `time_normed` held `Decimal`s.
+    * `datetime` was cut to whole seconds and given in the local time zone of the machine running the code, so the same pcap gave different values on different machines.
+    * `time_normed` was measured from the first row, which is not always the earliest packet. It was computed with one `.iloc` lookup per row (slow), and it crashed on an empty pcap.
+  * **Fix:**
+    * `time` is a float, in seconds since the epoch.
+    * `datetime` is a timezone-aware UTC timestamp with the full precision stored in the pcap (dtype `datetime64[ns, UTC]`). It is computed exactly from the pcap's decimal timestamp, not through a float.
+    * `time_normed` is the number of seconds since the earliest packet, as a float, computed in one vectorized step. An empty pcap gives an empty DataFrame.
+
+**Models and CLI**
+
+* **`netml classify` worked only with the `ocsvm` algorithm.**
+  * **Problem:**
+    * Models trained with `if`, `kde`, `gmm` or `pca` were trained and saved without error, but `classify` then crashed (`NotFittedError`, or for GMM `'GMM' object has no attribute 'means_'`). Their `fit()` stored the fitted model in `self.model_`, but never set the threshold that pyod's `predict()` needs.
+    * GMM's `predict()` came from scikit-learn's `GaussianMixture`, which returns the *mixture component* of each flow, not normal/anomaly.
+    * pyod's `predict()` returns 0 (normal) / 1 (anomaly), while `classify` expected OCSVM's 1 (normal) / -1 (anomaly), so a fixed model would still have been read the wrong way round.
+  * **Fix:**
+    * The pyod-based models (IF, KDE, GMM, PCA, AE) set their decision threshold at the end of `fit()`, with the new `netml.ndm.model.fit_threshold()`: the score above which a fraction `contamination` (default 0.1) of the training flows lie.
+    * GMM uses pyod's `predict()`.
+    * The new `netml.ndm.model.predict_anomalies(model, X)` returns `True` for anomalies whichever convention the model has; `classify` uses it.
+* **The `if` (Isolation Forest) model's scores pointed the wrong way.**
+  * **Problem:** pyod's `IForest` already turns scikit-learn's scores round so that outliers score higher, and netml's `IF` turned them round a second time. Normal flows scored as the most anomalous: on the example normal and anomaly pcaps, the AUC was 0.147 instead of 0.853, so `learn --algorithm if` reported a wrong score.
+  * **Fix:** the second inversion is removed. Every model's scores were checked against the reference implementation: pyod `IForest`, `PCA`, scikit-learn `KernelDensity`, `GaussianMixture`.
+* **`--param FILE` did not work**, although the help offered "YAML/JSON text or path to file". The path itself was parsed as YAML text (`[AttributeError] 'str' object has no attribute 'get'`).
+  * `--param` now accepts a path to a `.yaml`, `.yml` or `.json` file, or YAML/JSON text.
+  * A file with settings for several algorithms (`{ocsvm: {nu: 0.1}, kde: {bandwidth: 2}}`) now also works when training an algorithm it does not mention. Before, the algorithm names themselves were passed to the model as parameters.
+  * The parameters are now checked before feature extraction starts.
+* **The fraction of flows `classify` flags was hidden, and meant different things per algorithm.**
+  * **Problem:** it could only be set inside `--param`, under a different name per algorithm (`contamination` for IF, KDE, GMM, PCA and AE; `nu` for OCSVM), and with different defaults (0.1 vs. 0.5). Nothing told the user what it meant.
+  * **Fix:**
+    * A new `learn --contamination FRACTION` option, in (0, 0.5], default 0.1: the expected fraction of anomalies. `classify` will flag about this fraction of the flows that are similar to the training data. It sets `contamination` for the pyod-based models and `nu` for OCSVM, so it means the same for every algorithm.
+    * At the default verbosity, `learn` prints the value and its meaning, e.g. `contamination 0.1 (kde: contamination=0.1): classify will flag about 10% of flows similar to the training data (set with --contamination)`.
+    * `--param` can still set `contamination` / `nu` directly (then that value is used), but not together with `--contamination`.
+* **A pcap without TCP/UDP flows crashed with numpy errors**: `IndexError: index -1 is out of bounds…` on its own, or a `ValueError` about array dimensions together with other pcaps.
+  * The CLI now skips such a pcap, with a warning, and stops with a clear error if no pcap has a flow.
+  * In the library, `pcap2flows()` raises `ValueError('no flows: …')`, and `flow2features()` on a pcap without flows returns an empty 2-D array (0 rows), which can be concatenated with others.
+
+**Examples**
+
+* **The two demos were not connected.** `examples/pparser/pparser_demo.py` wrote its outputs into `examples/data/` (the inputs folder). `examples/ndm/ndm_demo.py` read `examples/out/data/demo_IAT.dat`, a file committed in 2020 (88 flows × 2 features) that the current parser does not produce.
+  * `pparser_demo.py` now writes to `examples/out/data/`.
+  * `demo_IAT.dat` was regenerated with the current parser (102 flows × 70 features).
+  * `ndm_demo.py` says to run `pparser_demo.py` first if its input is missing.
+* **`examples/capture/capture_pkts.py` tracked flows wrongly during a live capture, and could crash.** The script captures packets from a network interface into a pcap, and counts flows to know when to stop (after 1000 flows from one source IP).
+  * **Problem:**
+    * the timeout check was inverted (`<` where `>` was meant): a flow ended at every packet that came *within* the timeout, and continued after a long idle gap;
+    * after an idle gap, a flow was given the start time of whichever flow was seen last, so it could look over an hour long;
+    * the loop that ends flows lasting over an hour deleted entries of the dict it was looping over, which raises `RuntimeError: dictionary changed size during iteration`. With the wrong start times above, three packets were enough (flow A at 0 s, flow B at 1 s, flow A at 4000 s);
+    * that loop also ended the current packet's flow (`fid`) instead of the long flow it had found (`k`).
+  * **Fix:** the bookkeeping is now a function, `update_flows()`:
+    * a flow ends when it has been idle for longer than `FLOW_TIMEOUT` (600 s), and the packet starts a new flow;
+    * each flow keeps its own start time;
+    * flows that have lasted longer than `MAX_FLOW_DURATION` (one hour) are ended, looping over a copy of the dict.
+  * The captured packets were always written to the pcap; only the flow counting, and so when the capture stops, was affected.
+  * **Tests:** `update_flows()` is tested with synthetic packet times, and `capture()` end to end with synthetic packets in place of a live interface. Against the original logic, 5 of the 6 unit tests fail (one per bug), and the end-to-end test hits the `RuntimeError`.
+* **The committed `examples/out/data/OCSVM-results.dat` could not be loaded** (`No module named 'ndm'`: it was saved when the package had another name). It is removed from the repository; `ndm_demo.py` writes a new one. The files the demos generate are now in `.gitignore`.
+
+### Error messages and warnings
+
+Situations that are likely to be mistakes now produce a message instead of a crash, a numpy error or silence:
+
+| Situation | Message |
+|---|---|
+| `classify` with a model file whose feature length differs from the pcap's features | error: `the model expects N features per flow, but got M …` |
+| `classify` with an IF, KDE, GMM, PCA or AE model saved by an older netml | error: `… was trained by an older version of netml …; retrain it` |
+| `classify` with a model saved without extraction settings | warning: the split interval is computed from the pcap (unchanged from before) |
+| `classify` on a pcap without flows | warning: `no flows to extract features from …; nothing to classify` |
+| `learn` with a pcap without TCP/UDP flows | warning: `… has no TCP/UDP flow with at least N packets: skipped` |
+| `learn` with no flows at all | error: `no flows to extract features from …` |
+| A label file that matches none of a pcap's flows (e.g. the label file of another capture) | warning: `none of the N flows of … matched a row of the label file …` (then the pcap is skipped) |
+| `learn` with labels of one class only (e.g. only `--pcap-normal`) | warning: the model is trained but not tested; before, the AUC was `nan` |
+| `learn` with a test split that happens to hold only one class | warning: the model is not tested; try a larger `--test-size` |
+| `--param` with a missing file, invalid YAML, or not a mapping | error: `file not found: …`, `invalid YAML/JSON: …`, or `must be a mapping …` |
+| `--param` with an unknown parameter name | error naming it and listing the algorithm's parameters; before, a `[ValueError]` on standard output |
+| `--param` with `random_state` | error: use `--random-state` |
+| `--contamination` (or `--param` `contamination` / `nu`) not in (0, 0.5], e.g. 0 | error: `must be a fraction in (0, 0.5] … (0 would flag almost nothing …)` |
+| `--contamination` together with `--param` `contamination` / `nu` | error: `… both set …: set it once` |
+
+Errors go to standard error and exit with status 2, like other command-line errors.
 
 ### Other changes
 
@@ -331,6 +420,11 @@ This section lists the fixes and changes made to `pparser` (`src/netml/pparser/p
 * `get_shared_interval(pcaps, q_interval)` and `get_shared_pkts_dim(pcaps, q_interval)` compute settings shared by several `PCAP` objects.
 * `PCAP.flow2features(..., pkts_dim=None, sampling_rate=None)` accepts a fixed feature length and `SAMP_*` window; by default both are computed from the pcap, as before.
 * Settings used are kept on the object as `pcap.interval`, `pcap.pkts_dim` and `pcap.sampling_rate`.
+
+**New API in `ndm`**
+
+* `netml.ndm.model.predict_anomalies(model, X)`: a boolean array, `True` for anomalies, for every netml model.
+* `netml.ndm.model.fit_threshold(detector, X_train)`: sets the decision threshold of a pyod-based detector; called at the end of `fit()` by the IF, KDE, GMM, PCA and AE models.
 
 **Saved settings**
 
@@ -347,15 +441,62 @@ This section lists the fixes and changes made to `pparser` (`src/netml/pparser/p
 * For example, `examples/data/…/srcIP_10.42.0.1_normal.pcap` gave 4979 flows on its own before. Together with the anomaly pcap it now gives 5348.
 * The expected counts in `tests/cli_tests/test_learn.py` were updated, and each new count was checked against an independent implementation of the splitting rules.
 * With a single pcap, the CLI still uses that pcap's own settings, as before; only the fixes above change its results.
+* `pcap2pandas()`: code that reads `time`, `datetime`, `time_normed`, `dns_query` or `dns_resp` may need updating:
+  * `datetime` values now differ from before by the time-zone offset of the machine that produced them. For example, `2022-11-03 11:01:02` (local time, US Central) is now `2022-11-03 16:01:02.794004+00:00`. Use `df['datetime'].dt.tz_convert(...)` to show another time zone.
+  * `time` and `time_normed` are floats instead of `EDecimal` / `Decimal`; the values are the same.
+  * `dns_query` and `dns_resp` are strings instead of 1-element tuples; the text is the same.
+  * The other 13 columns are unchanged; this was checked on `uchicago-cs-20221103.pcap` and `netflix.pcap`.
+* **Models:**
+  * IF scores have the opposite sign from before, so AUCs reported for `if` change, e.g. from 0.147 to 0.853 on the example pcaps.
+  * Model files trained with `if`, `kde`, `gmm`, `pca` or `ae` by an older netml cannot classify; retrain them. They could not classify before either.
+  * With these models, `classify` flags a flow when its score is above the threshold set at training, which by default the 10% most anomalous training flows exceed. Set another fraction with `--contamination` (see below).
+  * When `learn` cannot test the model (only one class), the saved history has no `score`.
+* **OCSVM default: `nu` 0.5 → 0.1**, because `--contamination` now sets it.
+  * The old default flagged almost half of the normal traffic. On the example pcaps (trained on the normal and anomaly pcaps, as `netml learn` does):
+
+    | OCSVM | test AUC | normal pcap flagged | anomaly pcap flagged |
+    |---|---|---|---|
+    | old default, `nu=0.5` | 0.872 | 2426 / 5348 (45%) | 374 / 374 (100%) |
+    | new default, 0.1 | 0.800 | 397 / 5348 (7.4%) | 159 / 374 (42.5%) |
+
+  * Unlike the threshold of the pyod-based models, `nu` also changes the shape of OCSVM's decision function, so its AUC changes too. Use `--contamination 0.5` for the old behavior.
 
 **Performance**
 
 Measured on `http.pcap` and `netflix.pcap` against the previous version:
 
-* `pcap2pandas()` and `_pcap2flows()` are about 1–5% faster.
+* `_pcap2flows()` is about 1–5% faster.
+* `pcap2pandas()` is about 20% faster, e.g. 20.9 s → 16.9 s on `netflix.pcap` and 4.2 s → 3.4 s on `uchicago-cs-20221103.pcap`, mostly because `time_normed` is no longer computed row by row.
 * The size-based features are 80–97% faster, because `pkt.wirelen` is a stored number while `len(pkt)` rebuilds the packet.
 * `_get_header_features()` takes 0.119 s instead of 0.097 s on `http.pcap`. Generic layer lookup costs more than fixed positions, but a later optimization recovered most of it.
 * The full pcap → features pipeline time is unchanged within noise.
+
+**Code style (`tox -e lint`)**
+
+* **Problem:** the `lint` environment in `tox.ini` (`flake8 src`) had never passed: 75 warnings in the original code (60 before this cleanup). Mostly lines over 99 characters, plus `from scapy.all import *` (which kept flake8 from checking that names exist), two badly indented lines and one unused variable.
+* **Fix:** `flake8 src` now reports 0 warnings, with the current flake8 (7.5) and with the version pinned in `tox.ini` (3.8.3).
+  * Long lines are wrapped. Docstrings and comments are rewrapped, trailing comments moved onto their own line, and long messages split into adjacent string literals that Python joins into the same text.
+  * `from scapy.all import *` is replaced by explicit imports of the three names used (`PcapReader`, `DNSQR`, `DNSRR`), keeping `import scapy.all` (see [design decision 18](#18-replacing-from-scapyall-import-)).
+  * The unused `val_dataloader` in `ae.py` is kept and marked as such (`# noqa: F841`), since validation is not implemented yet.
+* **Style only, checked three ways:**
+  * the abstract syntax tree of every changed file is identical, apart from whitespace in docstrings and the imports in `parser.py`;
+  * the same 1279 scapy layers are loaded, and the imported names are the same objects as before;
+  * flows, header features, all 11 feature types and the `pcap2pandas()` DataFrame are identical on 4 pcaps, and all tests pass.
+* **One difference for code outside netml:** names that only came in through `from scapy.all import *` (e.g. `rdpcap`) can no longer be imported from `netml.pparser.parser`; import them from scapy instead. Nothing in netml did this.
+* **Tests and examples** (`tests/`, `examples/`, `test_my_changes.py`) are also flake8-clean (0 warnings with flake8 3.8.3 and 7.5). They were also checked with two common flake8 plugins: pep8-naming (PEP 8 naming conventions) and flake8-bugbear (error-prone patterns, which found nothing).
+  * Fixed:
+    * long lines and a missing space around an operator;
+    * a test helper named like a constant (`ETHER()` → `ether()`);
+    * local variables in `capture_pkts.py` renamed to lowercase (`srcIP` → `src_ip`, `TIMEOUT` → `timeout`);
+    * unused variables removed (`flow_type` in `capture_pkts.py`, one in `test_my_changes.py`);
+    * a string statement that did nothing turned into a comment (`capture_pkts.py`);
+    * two near-duplicate CLI helpers in `test_my_changes.py` merged into one, with two thin wrappers;
+    * an import repeated inside six tests moved to the top of the file.
+  * Kept on purpose:
+    * `X`, `X_train`, `X_test` for feature matrices: the scikit-learn convention, also used in `src/netml/ndm`;
+    * test names such as `test_get_SIZE_uses_wire_length`, which name the function they test (`_get_SIZE`);
+    * the class alias `PyodPCA`.
+  * Checked: every code-level difference was listed from the abstract syntax trees and reviewed, and each is one of the edits above. `test_my_changes.py` has the same 105 tests before and after, and all tests pass, including the ones that run the demos.
 
 **Tests**
 
@@ -372,6 +513,9 @@ Measured on `http.pcap` and `netflix.pcap` against the previous version:
 * **Private scapy classes:** `_ICMPv6` and `_IPv6ExtHdr` are imported from scapy and may change in a future scapy release.
 * **`--q-interval` has no effect in `classify`** when the model has saved settings; the training values are used.
 * **An unwritable `-f` / `-o` path is reported only at the end of a run**, when the file is written.
+* **The `ae` model was not tested**, because PyTorch is not installed in the test environment. It got the same threshold fix as the other models.
+* **`learn` trains on all flows, abnormal ones included**, and the train/test split is not stratified.
+* **`examples/capture/capture_pkts.py` carries a GNU GPL license header** in an Apache-2.0 project. It is left unchanged until the license of this file is decided.
 
 
 ## Design decisions (November 2026)
@@ -511,6 +655,174 @@ Each decision lists the choice made, the main alternatives, and their pros and c
   * Pros: independent of scapy's classes.
   * Cons: does not use what scapy already decoded.
 
+### 11. `pcap2pandas()` time and DNS columns
+
+**`datetime`**
+
+* **Chosen: timezone-aware UTC, full precision** (`datetime64[ns, UTC]`), computed exactly from the pcap timestamp.
+  * Pros: the same pcap gives the same values on every machine; no precision is lost; the time zone is explicit, so converting to any local time is one call (`dt.tz_convert`).
+  * Cons: values differ from earlier versions by the local time-zone offset, and comparing with naive datetimes needs a conversion first.
+* **Alternative: naive local time, full precision** (keep the old time-zone behavior, fix only the precision).
+  * Pros: closest to the old values.
+  * Cons: results still depend on the machine's time-zone setting, and daylight-saving changes make local times ambiguous.
+* **Alternative: naive UTC** (no time zone attached).
+  * Pros: machine-independent, and compares directly with other naive datetimes.
+  * Cons: nothing in the data says the values are UTC, so they are easily mistaken for local time.
+
+**`time` and `time_normed`**
+
+* **Chosen: floats** (seconds).
+  * Pros: a normal numeric pandas column, fast and usable with numpy.
+  * Cons: a float holds a present-day epoch timestamp to about 0.24 µs, so nanosecond-precision pcaps lose their last digits here. The exact value is still in `datetime`, and `time_normed` is computed from it.
+* **Alternative: keep scapy's `EDecimal`.**
+  * Pros: exact.
+  * Cons: an `object` column; slow, and awkward with numpy and plotting.
+
+**`time_normed` reference point**
+
+* **Chosen: the earliest packet.**
+  * Pros: never negative, and correct when packets are not stored in time order.
+  * Cons: differs from before for pcaps whose first packet is not the earliest.
+* **Alternative: the first packet in the file (the old behavior).**
+  * Pros: no change.
+  * Cons: gives negative times for packets stored out of order.
+
+**DNS values**
+
+* **Chosen:**
+  * names and answers as strings;
+  * TXT records (a list of byte strings in scapy) joined with spaces;
+  * invalid UTF-8 bytes replaced with `�`.
+  * Pros: one string column; a malformed packet no longer stops the whole parse.
+  * Cons: joining loses the boundaries between TXT strings, and replaced bytes cannot be recovered from the DataFrame.
+* **Alternative: keep lists for TXT records.**
+  * Pros: no information lost.
+  * Cons: a column that mixes strings and lists.
+* **Alternative: fail, or skip the packet, on invalid UTF-8.**
+  * Pros: never shows altered text.
+  * Cons: one bad packet would stop or silently shorten the whole DataFrame.
+
+
+### 12. One classification convention, and the threshold of the pyod-based models
+
+* **Chosen:**
+  * a helper, `predict_anomalies()`, that turns each model's convention into `True` = anomaly;
+  * for the pyod-based models, a threshold set at the end of `fit()` so that a fraction `contamination` (default 0.1) of the training flows lie above it (pyod's own rule).
+  * Pros: every algorithm can classify; each model keeps the `predict()` of its library, so code that uses `predict()` directly does not change meaning; the threshold can be adjusted with `--contamination` (see [design decision 17](#17---contamination-one-option-for-the-expected-fraction-of-anomalies)).
+  * Cons:
+    * two conventions remain inside the models, and callers should use `predict_anomalies()`;
+    * by construction, about 10% of flows like the training data are flagged, even when the training data has no anomalies.
+* **Alternative: change every model's `predict()` to one convention** (e.g. all 1/-1 like scikit-learn).
+  * Pros: one convention everywhere.
+  * Cons: silently changes the meaning of `predict()` for existing users of pyod-style models.
+* **Alternative: a threshold chosen with labels** (e.g. maximizing an F-score on the test split), **or a user-given score threshold.**
+  * Pros: can be better calibrated.
+  * Cons: needs labeled data or knowledge of the score scale, which unsupervised training does not have; possible later as an option.
+
+**IF scores:** the double inversion was removed instead of, e.g., inverting `predict()` as well, so that `decision_function()` means the same for every model: higher = more anomalous, which is what the AUC uses.
+
+### 13. `--param`: file or text
+
+* **Chosen:**
+  * an existing file is read;
+  * a value ending in `.yaml`, `.yml` or `.json` that is not an existing file is an error (`file not found`);
+  * anything else is parsed as YAML/JSON text;
+  * the result must be a mapping, and the names are checked against the model before extraction starts.
+  * Pros: one option for both forms, as documented; typos in file names or parameter names are reported at once, not after a long extraction.
+  * Cons: inline text that happens to be the name of an existing file is read as that file.
+* **Alternative: separate options** (e.g. `--param` for text, `--param-file` for files).
+  * Pros: no ambiguity.
+  * Cons: changes the documented interface.
+
+### 14. pcaps without flows: skip with a warning
+
+* **Chosen:**
+  * the CLI skips a pcap that has no TCP/UDP flow, or none left after labeling, and warns;
+  * it stops with an error only if no pcap is left (`classify` warns and reports nothing);
+  * the library raises a clear `ValueError`.
+  * Pros: one empty capture does not stop a run over many; the user is told which file was skipped and why.
+  * Cons: a run can succeed with less data than expected if warnings are not read.
+* **Alternative: stop on any pcap without flows.**
+  * Pros: strict.
+  * Cons: a single empty or non-IP capture blocks the others.
+
+### 15. Labels of one class: warn and skip the test
+
+* **Chosen:** when all labels, or all labels of the test split, are of one class, train the model, skip the test (no AUC) and warn.
+  * Pros: no `nan` score, and training on normal traffic only (`--pcap-normal` alone) works.
+  * Cons: the history has no `score` in that case.
+* **Alternative: stratify the train/test split** by label.
+  * Pros: both classes always reach the test split when both exist.
+  * Cons: changes which flows are used for training and testing, and so the scores of existing runs. Listed as a possible follow-up.
+
+### 16. Example outputs in the repository
+
+* **Chosen:**
+  * keep `examples/out/data/demo_IAT.dat` (regenerated), so `ndm_demo.py` runs on its own;
+  * remove the saved model `OCSVM-results.dat`;
+  * ignore the files the demos generate.
+  * Pros: the demos work from a fresh checkout; no saved model goes stale in the repository again.
+  * Cons: `demo_IAT.dat` must be regenerated when the parser changes its output. A test (`test_committed_demo_features_match_parser`) checks this.
+* **Alternative: regenerate and commit `OCSVM-results.dat` too.**
+  * Pros: an example model is at hand.
+  * Cons: a pickled scikit-learn model is tied to library versions and breaks again when they change.
+* **Alternative: commit no outputs at all.**
+  * Pros: nothing goes stale.
+  * Cons: `ndm_demo.py` then always needs `pparser_demo.py` to run first.
+
+
+### 17. `--contamination`: one option for the expected fraction of anomalies
+
+The fraction controls the trade-off between false alarms and missed anomalies. On traffic like the training data, the share of flows flagged comes out close to it. Measured on the example pcaps, training on 2/3 of the normal flows:
+
+| contamination | false alarms on held-out normal flows | anomalies caught (KDE / GMM / PCA) |
+|---|---|---|
+| 0 | 0–0.2% | 0.3% / 7.5% / 4.0% |
+| 0.001 | 0–0.3% | 3.7% / 8.0% / 7.8% |
+| 0.01 | ~1% | 4.0% / 22.7% / 21.7% |
+| 0.05 | ~4.5% | 23.8% / 34.5% / 34.8% |
+| 0.1 | ~10% | 73.0% / 67.6% / 67.4% |
+
+When trained on all flows (normal and anomaly, as `netml learn` does), 0 caught 0.0% of the anomalies with all three models: the anomalies in the training data raise the highest training score, and the threshold with it.
+
+**One option for every algorithm**
+
+* **Chosen: `--contamination`, mapped to `contamination` (pyod models) or `nu` (OCSVM).**
+  * Pros: the trade-off is visible in `--help`, and means the same for every algorithm. For OCSVM, `nu` bounds the fraction of training flows outside the boundary, so on its training data OCSVM flags about the same fraction as the others (checked: 5% → about 5%).
+  * Cons: for OCSVM, `nu` also reshapes the decision function, so changing it changes OCSVM's AUC, not just its threshold.
+* **Alternative: keep it inside `--param`, with per-algorithm names.**
+  * Pros: no new option.
+  * Cons: hidden, and the same number meant different things (`nu` 0.5 vs. `contamination` 0.1 by default).
+
+**Default 0.1**
+
+* **Chosen: 0.1**, pyod's default, for every algorithm.
+  * Pros: catches most of the anomalies in the experiment above, and keeps the pyod-based models' behavior unchanged.
+  * Cons: about 10% false alarms on traffic like the training data; changes OCSVM's default (`nu` was 0.5).
+* **Alternative: 0.01.**
+  * Pros: about 1% false alarms, suited to monitoring where alerts are expensive.
+  * Cons: catches far fewer anomalies (about 4–23% above).
+* **Alternative: 0** (flag only flows more anomalous than every training flow).
+  * Cons: not accepted by pyod (IF rejects it); the threshold is set by the single most extreme training flow; and `classify` reports almost nothing, so the detector fails silently. Rejected, with an error explaining why.
+
+**`--contamination` and `--param` together**
+
+* **Chosen:** the value in `--param` is used if given; giving both is an error.
+  * Pros: existing `--param` files keep working; never ambiguous.
+  * Cons: one more error case.
+* **Alternative: one silently overrides the other.**
+  * Cons: easy to misread which value was used.
+
+
+### 18. Replacing `from scapy.all import *`
+
+* **Chosen: `import scapy.all` (kept for its side effect), plus explicit imports of the names used.**
+  * Pros: importing `scapy.all` loads all of scapy's default protocol layers, which decides how packets are dissected, e.g. whether IP inside PPP or GRE is decoded, and so which flows are found. Keeping it guarantees identical dissection, while flake8 can now check every name.
+  * Cons: still loads all of scapy's layers (slower start-up), and `import scapy.all` looks unused, so it needs a `# noqa` comment explaining it.
+* **Alternative: import only the modules of the layers used** (`scapy.layers.inet`, `scapy.layers.dns`, …).
+  * Pros: faster import, fully explicit.
+  * Cons: protocols whose layers are no longer loaded would stop being decoded, changing results silently (e.g. TCP inside PPPoE). It would need a careful audit of every encapsulation.
+
 
 ## To Do
 
@@ -532,11 +844,14 @@ Further work includes:
   - optionally compute the shared extraction settings from normal-labeled flows only (see [design decision 4](#4-several-pcaps-in-the-cli-one-shared-split-interval-and-feature-length)).
 - `pcap2pandas()`: optional `layers`, `ip_proto` and `ethertype` columns; an option to label tunneled packets by their outer protocol (see [design decision 3](#3-protocol-labels-explicit-list-then-protocol-number-then-none)).
 - CLI:
+  - a stratified train/test split, and an option to train on normal flows only (see [design decision 15](#15-labels-of-one-class-warn-and-skip-the-test));
   - a separate `learn test` action;
   - a clear error for invalid model files;
   - check that `-f` / `-o` paths are writable before a run starts;
   - less verbose library output at the default verbosity;
   - see also the `TODO` comments in `src/netml/cli.py`.
+- Lint `tests/` and `examples/` in `tox -e lint` too (`flake8 src tests examples`); they are clean now.
+- Resolve the GPL license header of `examples/capture/capture_pkts.py` (see [Known limitations](#known-limitations-not-changed)).
 
 We welcome any comments to make this tool more robust and easier to use!
 

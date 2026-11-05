@@ -13,6 +13,10 @@ from scapy.sendrecv import sniff
 from scapy.utils import wrpcap
 
 
+FLOW_TIMEOUT = 600  # seconds: a flow ends when it has been idle for longer than this
+MAX_FLOW_DURATION = 60 * 60  # seconds: a flow that has lasted longer than this is ended
+
+
 def _get_fid(pkt):
     """Extract fid (five-tuple) from a packet: only focus on IPv4
     Parameters
@@ -24,10 +28,8 @@ def _get_fid(pkt):
     """
 
     if IP in pkt and TCP in pkt:
-        flow_type = 'TCP'
         fid = (pkt[IP].src, pkt[IP].dst, pkt[TCP].sport, pkt[TCP].dport, 6)
     elif IP in pkt and UDP in pkt:
-        flow_type = 'UDP'
         fid = (pkt[IP].src, pkt[IP].dst, pkt[UDP].sport, pkt[UDP].dport, 17)
     else:
         fid = ('', '', -1, -1, -1)
@@ -48,7 +50,7 @@ def get_device_interfaces(verbose=10):
     """
     # not work on mac
     # from scapy.arch.windows import IFACES
-    """Print list of available network interfaces"""
+    # Print list of available network interfaces
     # print(IFACES.show(resolve_mac))
     # print(IFACES.show())
 
@@ -63,6 +65,49 @@ def get_device_interfaces(verbose=10):
             pprint(netifaces.ifaddresses(intf))
 
     return ifaces
+
+
+def update_flows(pkt_time, fid, flow_buffer, flows, timeout=FLOW_TIMEOUT,
+                 max_duration=MAX_FLOW_DURATION):
+    """Track flows with one more packet.
+
+    Parameters
+    ----------
+    pkt_time: float
+        arrival time of the packet
+
+    fid: five-tuple
+        flow id of the packet
+
+    flow_buffer: dict
+        flows in progress: fid -> (number of packets, start time, time of the last packet)
+
+    flows: dict
+        ended flows, as in flow_buffer (a newer flow with the same fid replaces an older one)
+
+    timeout: float
+        a flow ends when it has been idle for longer than this (seconds)
+
+    max_duration: float
+        flows that have lasted longer than this are ended (seconds)
+    """
+    if fid not in flow_buffer:
+        flow_buffer[fid] = (1, pkt_time, pkt_time)
+        return
+
+    (pkt_cnt, start_time, pre_pkt_time) = flow_buffer[fid]
+    if pkt_time - pre_pkt_time > timeout:
+        # idle for longer than the timeout: the flow has ended, and this packet starts a new one
+        flows[fid] = flow_buffer[fid]
+        flow_buffer[fid] = (1, pkt_time, pkt_time)
+    else:
+        flow_buffer[fid] = (pkt_cnt + 1, start_time, pkt_time)
+
+    # end the flows that have lasted too long, to keep flow_buffer small
+    # (loop over a copy of the items: entries are removed from flow_buffer in the loop)
+    for (k, (_pkt_cnt, k_start_time, k_pre_pkt_time)) in list(flow_buffer.items()):
+        if k_pre_pkt_time - k_start_time > max_duration:
+            flows[k] = flow_buffer.pop(k)
 
 
 def capture(iface='en0', out_file='capture.pcap'):
@@ -89,40 +134,20 @@ def capture(iface='en0', out_file='capture.pcap'):
         os.remove(out_file)
 
     pkt_buffer = []  # buffer size of packets
-    flow_buffer = {}  # buffer size of flows
-    srcIP = '192.168.143.76'
-    TIMEOUT = 600  # 600 seconds
+    flow_buffer = {}  # flows in progress (see update_flows)
+    src_ip = '192.168.143.76'
 
-    flows = {}
+    flows = {}  # ended flows
     for pkt in sniff(iface=iface, count=2000):
         pkt_buffer.append(pkt)
 
         pkt_time = pkt.time
-        if len([fid for fid in flows.keys() if srcIP == fid[0]]) > 1000:  # number of flows
+        if len([fid for fid in flows.keys() if src_ip == fid[0]]) > 1000:  # number of flows
             wrpcap(out_file, pkt_buffer, append=True)  # appends packet to output file
             pkt_buffer = []
             break
         fid = _get_fid(pkt)
-
-        if fid not in flow_buffer.keys():
-            pre_pkt_time = pkt_time
-            start_time = pkt_time
-            flow_buffer[fid] = (1, start_time, pre_pkt_time)
-        else:
-            pre_pkt_time = flow_buffer[fid][2]
-            if pkt_time - pre_pkt_time < TIMEOUT:  # 10mins = 10*60s
-                flows[fid] = flow_buffer[fid]
-                del flow_buffer[fid]  # pop out from the buffer
-                flow_buffer[fid] = (1, pkt_time, pkt_time)
-            else:
-                flow_buffer[fid] = (flow_buffer[fid][0] + 1, start_time, pkt_time)
-
-            # check flow_buffer and try to reduce its size
-            for k in flow_buffer.keys():
-                pkt_cnt, pkt_start_time, pre_pkt_time = flow_buffer[k]
-                if pre_pkt_time - pkt_start_time > 60 * 60:  # 1 hour
-                    flows[fid] = flow_buffer[fid]
-                    del flow_buffer[fid]  # pop out from the buffer
+        update_flows(pkt_time, fid, flow_buffer, flows)
 
         if len(pkt_buffer) > 10000:  # buffer size of packets
             wrpcap(out_file, pkt_buffer, append=True)  # appends packet to output file

@@ -11,6 +11,8 @@ from sklearn.compose._column_transformer import _check_X
 from sklearn.neighbors import KernelDensity
 from sklearn.neighbors._kde import VALID_KERNELS
 
+from netml.ndm.model import fit_threshold
+
 
 class KDE(KernelDensity, BaseDetector):
 
@@ -104,11 +106,15 @@ class KDE(KernelDensity, BaseDetector):
 
         self.model_.fit(X_train)
 
+        # decision threshold, needed by predict() (see netml.ndm.model.fit_threshold)
+        fit_threshold(self, X_train)
+
         return self
 
     def decision_function(self, X):
         """Predict raw anomaly scores of X using the fitted detector.
-        After invert_order(): the higher score, the more probability of x that is predicted as abnormal
+        After invert_order(): the higher score, the more probability of x that is predicted as
+        abnormal
 
         Parameters
         ----------

@@ -10,6 +10,8 @@ from scipy.special import logsumexp
 from sklearn.compose._column_transformer import _check_X
 from sklearn.mixture import GaussianMixture
 
+from netml.ndm.model import fit_threshold
+
 
 class GMM(GaussianMixture, BaseDetector):
 
@@ -52,7 +54,8 @@ class GMM(GaussianMixture, BaseDetector):
             The user-provided initial means, defaults to None,
 
         precisions_init : array-like, optional.
-            The user-provided initial precisions (inverse of the covariance matrices), defaults to None.
+            The user-provided initial precisions (inverse of the covariance matrices),
+            defaults to None.
 
 
         warm_start : bool, default to False.
@@ -119,6 +122,9 @@ class GMM(GaussianMixture, BaseDetector):
                                       verbose_interval=self.verbose_interval)
         self.model_.fit(X=X, y=y)
 
+        # decision threshold, needed by predict() (see netml.ndm.model.fit_threshold)
+        fit_threshold(self, X)
+
         return self
 
     def decision_function(self, X):
@@ -128,7 +134,8 @@ class GMM(GaussianMixture, BaseDetector):
         detector. For consistency, outliers are assigned with
         larger anomaly scores. so use invert_order
 
-        After invert_order(): the higher score, the more probability of x that is predicted as abnormal
+        After invert_order(): the higher score, the more probability of x that is predicted as
+        abnormal
 
         Parameters
         ----------
@@ -143,6 +150,10 @@ class GMM(GaussianMixture, BaseDetector):
         """
         # check_is_fitted(self, ['decision_scores_', 'threshold_', 'labels_'])
         return invert_order(logsumexp(self.model_._estimate_weighted_log_prob(X), axis=1))
+
+    # GaussianMixture comes first in the bases, so its predict() -- which returns the number of the
+    # mixture component of each sample -- would hide pyod's predict() (0 normal / 1 anomaly)
+    predict = BaseDetector.predict
 
     def predict_proba(self, X):
         raise NotImplementedError
