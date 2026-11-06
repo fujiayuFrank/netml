@@ -552,6 +552,18 @@ Measured on `http.pcap` and `netflix.pcap` against the previous version:
 ### Known limitations (not changed)
 
 * **`interval` is an idle-time threshold, not a window length.** A flow is split only where two consecutive packets are more than `interval` seconds apart, so a steady long flow stays one subflow.
+* **Within one pcap, most feature values are padding, and long flows lose their tails.** Features such as `IAT` lay out a flow's per-packet values by position (column k = the k-th gap between packets), fixed to `pkts_dim - 1` values. `pkts_dim` is the 0.9 quantile (`--q-interval`) of packets per flow, so about 90% of flows are padded with 0 and up to 10% are cut. This is the same in the original code; it is not a crash, but it costs information. Measured with each pcap's own settings:
+
+  | pcap | packets per flow | width (gaps) | flows padded | flows cut | padded zeros among all values | gaps lost by cutting |
+  |---|---|---|---|---|---|---|
+  | `demo.pcap` | 4 – 780 (median 8) | 51 | 89% | 9% | 70% | 45% |
+  | `srcIP_10.42.0.1_normal.pcap` | 2 – 27 (median 6) | 12 | 89% | 7% | 54% | 1% |
+  | `srcIP_10.42.0.119_anomaly.pcap` | 2 – 93 (median 4) | 12 | 89% | 10% | 56% | 27% |
+
+  * Short flows differ mostly in their number of trailing zeros, so a model may learn the flow length rather than the timing pattern.
+  * A padded 0 ("no packet") looks like a real 0 gap ("two packets with the same timestamp"); `demo.pcap` has 3005 real zero gaps.
+  * Anything that happens late in a long flow is cut off (45% of all gaps of `demo.pcap`).
+  * A row with 3 real gaps and 48 zeros counts as much as a row with 51 real gaps.
 * **Features are not scaled** before modeling. A scaler would have to be fit on the training data and saved with the model, like the extraction settings.
 * **Fallback protocol names come from the OS.** scapy loads its tables from `/etc/protocols` and `/etc/ethertypes`, so on systems without them, step 2 of the protocol labeling finds fewer names.
 * **Private scapy classes:** `_ICMPv6` and `_IPv6ExtHdr` are imported from scapy and may change in a future scapy release.
@@ -916,6 +928,13 @@ Further work includes:
 - Add examples
 - Add (generated) docs
 - Feature extraction:
+  - reduce the cost of padding and cutting within a pcap (see [Known limitations](#known-limitations-not-changed)):
+    - add the real number of packets of each flow as an extra feature, so a model can tell padding from data;
+    - pad with a value a real gap cannot have (e.g. -1) instead of 0 to reduce ambiguity;
+    - split long flows into several rows of the fixed length instead of cutting them, so no packets are lost;
+    - offer `STATS` (a fixed 12-value summary per flow: no padding or cutting, but no packet order) in the CLI (see `--feature-type` below);
+    - consider sequence models (e.g. RNNs), which accept flows of any length;
+    - options to choose the feature length and split interval directly (`--pkts-dim`, `--interval`), and a warning when the chosen length pads or cuts most flows;
   - scale features: fit a scaler on the training data and save it with the model, like the extraction settings;
   - choose the feature type in the CLI (`--feature-type`, `--fft`, `--header`); only `IAT` is extracted now;
   - offer fixed-length time windows as an alternative to the idle-time `interval` split (see [design decision 7](#7-flow-splitting-keep-the-last-subflow-keep-the-meaning-of-interval));
