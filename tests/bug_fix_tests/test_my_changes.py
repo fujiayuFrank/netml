@@ -63,6 +63,7 @@ import subprocess
 import sys
 import warnings
 import ipaddress
+import itertools
 import os
 import pickle
 import tempfile
@@ -674,6 +675,248 @@ class ExtractionSettingsCLITests(unittest.TestCase):
         _stdout, stderr = _run_cli('classify', '-m', old_model_path, '-p', NORMAL_PCAP)
         self.assertIn('no saved feature-extraction settings', stderr)
         self.assertNotIn('Error', stderr)
+
+
+DEMO_CSV = os.path.join(EXAMPLES_DIR, 'demo.csv')
+
+
+def _raw_flows(pcap_file):
+    pcap = PCAP(pcap_file)
+    pcap.extract_flows()
+    return pcap.raw_flows
+
+
+def _normal_fids(label_file):
+    """Flow ids labeled BENIGN/NORMAL in a CICIDS-style label file (the last row of a fid wins,
+    as in PCAP.label_flows)."""
+    csv = pd.read_csv(label_file)
+    labels = {}
+    for (_i, row) in csv.iterrows():
+        fid = (str(row[' Source IP']), str(row[' Destination IP']), int(row[' Source Port']),
+               int(row[' Destination Port']), int(row[' Protocol']))
+        labels[fid] = row[' Label'].upper() in ('BENIGN', 'NORMAL')
+    return {fid for (fid, normal) in labels.items() if normal}
+
+
+class CLIExtractionSettingsModeTests(unittest.TestCase):
+    """learn --extraction-settings: shared (default), per-pcap (the original behavior),
+    common-length, normal-only; classify follows the mode the model was trained with."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.TemporaryDirectory()
+        cls.tmp = cls.tmpdir.name
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmpdir.cleanup()
+
+    def _path(self, name):
+        return os.path.join(self.tmp, self._testMethodName + '-' + name)
+
+    def _extract(self, mode, *pcap_args):
+        """learn extract with a mode. Returns (FeatureData, stderr)."""
+        features_path = self._path('features')
+        args = ('learn', 'extract', '-f', features_path) + pcap_args
+        if mode is not None:
+            args += ('--extraction-settings', mode)
+        (_stdout, stderr) = _run_cli(*args)
+        return load_data(features_path), stderr
+
+    # --- shared (default) ---
+
+    def test_default_is_shared(self):
+        (data, stderr) = self._extract(None, '--pcap-normal', NORMAL_PCAP,
+                                       '--pcap-abnormal', ANOMALY_PCAP)
+        self.assertEqual(data.params['extraction_settings'], 'shared')
+        pcaps = []
+        for pcap_file in (NORMAL_PCAP, ANOMALY_PCAP):
+            pcap = PCAP(pcap_file)
+            pcap.extract_flows()
+            pcaps.append(pcap)
+        self.assertAlmostEqual(data.params['interval'], parser.get_shared_interval(pcaps, 0.9))
+        self.assertNotIn('warning', stderr)
+
+    def test_shared_explicit_equals_default(self):
+        (default, _stderr) = self._extract(None, '-p', DEMO_PCAP)
+        (shared, _stderr) = self._extract('shared', '-p', DEMO_PCAP)
+        np.testing.assert_array_equal(default[0], shared[0])
+        self.assertEqual(default.params, shared.params)
+
+    def test_prints_mode_and_meaning(self):
+        (stdout, _stderr) = _run_cli('-v', '1', 'learn', 'extract', '-p', DEMO_PCAP,
+                                     '-f', self._path('features'))
+        self.assertIn('extraction settings: shared', stdout)
+
+    def test_invalid_mode(self):
+        (code, stderr) = _run_cli_status('learn', 'extract', '-p', DEMO_PCAP,
+                                         '-f', self._path('features'),
+                                         '--extraction-settings', 'nonsense')
+        self.assertEqual(code, 2)
+        self.assertIn('--extraction-settings', stderr)
+
+    # --- per-pcap (the original behavior) ---
+
+    def test_per_pcap_single_pcap_works_with_warning(self):
+        (data, stderr) = self._extract('per-pcap', '-p', DEMO_PCAP)
+        self.assertEqual(data.params['extraction_settings'], 'per-pcap')
+        self.assertIn('warning', stderr)
+        self.assertIn('per-pcap', stderr)
+        self.assertIn('different lengths', stderr)
+        # each pcap's own settings: as PCAP.pcap2flows + flow2features
+        expected = _iat_features(DEMO_PCAP, q_interval=0.9)
+        np.testing.assert_array_equal(data[0], expected.features)
+
+    def test_per_pcap_several_pcaps_clear_error(self):
+        """Before (original netml): numpy "all the input array dimensions ... must match".
+
+        normal.pcap alone gets feature length 13, demo.pcap 52. (normal.pcap and anomaly.pcap
+        now both get 13 on their own, so they would happen to work.)
+        """
+        features_path = self._path('features')
+        (code, stderr) = _run_cli_status('learn', 'extract', '-f', features_path,
+                                         '--extraction-settings', 'per-pcap',
+                                         '--pcap-normal', NORMAL_PCAP,
+                                         '--pcap-abnormal', DEMO_PCAP)
+        self.assertEqual(code, 2)
+        self.assertIn('different lengths', stderr)
+        self.assertIn(os.path.basename(NORMAL_PCAP) + ': 12', stderr)
+        self.assertIn(os.path.basename(DEMO_PCAP) + ': 51', stderr)
+        self.assertIn('shared', stderr)  # suggests the default
+        self.assertFalse(os.path.exists(features_path))
+
+    def test_per_pcap_several_pcaps_same_length_works(self):
+        """The original behavior works when the lengths happen to match (same pcap twice)."""
+        (data, stderr) = self._extract('per-pcap', '--pcap-normal', DEMO_PCAP,
+                                       '--pcap-abnormal', DEMO_PCAP)
+        expected = _iat_features(DEMO_PCAP, q_interval=0.9)
+        self.assertEqual(data[0].shape, (2 * len(expected.features), expected.features.shape[1]))
+        self.assertIn('warning', stderr)
+
+    def test_per_pcap_classify(self):
+        model_path = self._path('model')
+        _run_cli('-v', '0', 'learn', '-p', DEMO_PCAP, '-o', model_path,
+                 '--extraction-settings', 'per-pcap')
+
+        # the training pcap: the same settings are recomputed, so it works
+        (code, stderr) = _run_cli_status('classify', '-m', model_path, '-p', DEMO_PCAP)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('per-pcap', stderr)  # warned
+
+        # another pcap: different feature length -> clear error naming the mode
+        (code, stderr) = _run_cli_status('classify', '-m', model_path, '-p', NORMAL_PCAP)
+        self.assertEqual(code, 2)
+        self.assertIn('per-pcap', stderr)
+        self.assertIn('features', stderr)
+
+    # --- common-length ---
+
+    def test_common_length_own_interval_shared_length(self):
+        (data, stderr) = self._extract('common-length', '--pcap-normal', NORMAL_PCAP,
+                                       '--pcap-abnormal', ANOMALY_PCAP)
+        params = data.params
+        self.assertEqual(params['extraction_settings'], 'common-length')
+        self.assertIsNone(params['interval'])  # each pcap has its own
+        self.assertNotIn('warning', stderr)
+
+        # each pcap split by its own interval, as when it is alone
+        alone = [_iat_features(pcap_file, q_interval=0.9)
+                 for pcap_file in (NORMAL_PCAP, ANOMALY_PCAP)]
+        self.assertEqual(len(data[0]), sum(len(pcap.flows) for pcap in alone))
+        self.assertEqual(sorted(params['intervals'].values()),
+                         sorted(float(pcap.interval) for pcap in alone))
+
+        # one feature length: the quantile over all (sub)flows of both pcaps
+        all_flows = list(itertools.chain.from_iterable(pcap.flows for pcap in alone))
+        self.assertEqual(params['pkts_dim'], parser.get_flows_pkts_dim(all_flows, 0.9))
+        self.assertEqual(data[0].shape[1], params['pkts_dim'] - 1)
+
+        # the normal pcap's rows: its own subflows, padded/truncated to the common length
+        normal = PCAP(NORMAL_PCAP)
+        normal.pcap2flows(q_interval=0.9)
+        normal.flow2features('IAT', pkts_dim=params['pkts_dim'])
+        np.testing.assert_array_equal(data[0][:len(normal.features)], normal.features)
+
+    def test_common_length_classify_other_pcap(self):
+        model_path = self._path('model')
+        _run_cli('-v', '0', 'learn', '-p', DEMO_PCAP, '-o', model_path,
+                 '--extraction-settings', 'common-length')
+        (code, stderr) = _run_cli_status('classify', '-m', model_path, '-p', NORMAL_PCAP)
+        self.assertEqual(code, 0, stderr)
+
+    # --- normal-only ---
+
+    def test_normal_only_with_normal_and_abnormal_pcaps(self):
+        (data, stderr) = self._extract('normal-only', '--pcap-normal', NORMAL_PCAP,
+                                       '--pcap-abnormal', ANOMALY_PCAP)
+        params = data.params
+        self.assertEqual(params['extraction_settings'], 'normal-only')
+        self.assertEqual(params['settings_flows'], 'normal')
+        self.assertNotIn('warning', stderr)
+
+        # the settings are those of the normal pcap alone
+        normal = _iat_features(NORMAL_PCAP, q_interval=0.9)
+        self.assertAlmostEqual(params['interval'], normal.interval)
+        self.assertEqual(params['pkts_dim'], normal.pkts_dim)
+        self.assertEqual(data[0].shape[1], normal.pkts_dim - 1)
+
+        # ...and differ from the shared ones (the anomaly pcap no longer counts)
+        (shared, _stderr) = self._extract('shared', '--pcap-normal', NORMAL_PCAP,
+                                          '--pcap-abnormal', ANOMALY_PCAP)
+        self.assertNotAlmostEqual(params['interval'], shared.params['interval'])
+        # the labels are the same in both modes
+        self.assertEqual(len(data[1]), len(data[0]))
+
+    def test_normal_only_with_label_file(self):
+        (data, stderr) = self._extract('normal-only', '-p', DEMO_PCAP, '-l', DEMO_CSV)
+        params = data.params
+        self.assertEqual(params['settings_flows'], 'normal')
+        self.assertNotIn('warning', stderr)
+
+        normal_fids = _normal_fids(DEMO_CSV)
+        normal_raw = [(fid, pkts) for (fid, pkts) in _raw_flows(DEMO_PCAP) if fid in normal_fids]
+        self.assertTrue(normal_raw)
+        self.assertAlmostEqual(params['interval'], parser.get_flows_interval(normal_raw, 0.9))
+
+        # the label file was read again for labeling: every kept flow has a label
+        self.assertEqual(len(data[1]), len(data[0]))
+        self.assertIn(0, set(data[1]))
+        self.assertIn(1, set(data[1]))
+
+    def test_normal_only_unlabeled_falls_back_with_warning(self):
+        (data, stderr) = self._extract('normal-only', '-p', DEMO_PCAP)
+        self.assertIn('warning', stderr)
+        self.assertIn('no normal-labeled flows', stderr)
+        self.assertEqual(data.params['settings_flows'], 'all')
+        (shared, _stderr) = self._extract('shared', '-p', DEMO_PCAP)
+        self.assertEqual(data.params['interval'], shared.params['interval'])
+        self.assertEqual(data.params['pkts_dim'], shared.params['pkts_dim'])
+
+    def test_normal_only_only_abnormal_falls_back_with_warning(self):
+        (data, stderr) = self._extract('normal-only', '--pcap-abnormal', ANOMALY_PCAP)
+        self.assertIn('no normal-labeled flows', stderr)
+        self.assertEqual(data.params['settings_flows'], 'all')
+
+    def test_normal_only_classify_other_pcap(self):
+        model_path = self._path('model')
+        _run_cli('-v', '0', 'learn', '--pcap-normal', NORMAL_PCAP, '--pcap-abnormal', ANOMALY_PCAP,
+                 '-o', model_path, '--extraction-settings', 'normal-only')
+        (model, _history) = load_data(model_path)
+        self.assertEqual(model.extraction_params['extraction_settings'], 'normal-only')
+        (code, stderr) = _run_cli_status('classify', '-m', model_path, '-p', DEMO_PCAP)
+        self.assertEqual(code, 0, stderr)
+
+    # --- files made before --extraction-settings ---
+
+    def test_model_without_mode_is_shared(self):
+        model_path = self._path('model')
+        _run_cli('-v', '0', 'learn', '-p', DEMO_PCAP, '-o', model_path)
+        (model, history) = load_data(model_path)
+        del model.extraction_params['extraction_settings']
+        dump_data((model, history), out_file=model_path)
+        (code, stderr) = _run_cli_status('classify', '-m', model_path, '-p', NORMAL_PCAP)
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn('per-pcap', stderr)
 
 
 class CLIFeatureFileTests(unittest.TestCase):

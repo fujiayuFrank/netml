@@ -93,12 +93,12 @@ after:  /home/frank/netml (current code)
 ### learn train -f FILE empties FILE
 - input:  learn extract -f F, then learn train -f F
 - before: exit 1: [EOFError] Ran out of input; features file 80133 -> 0 bytes
-- after:  exit 0 (ok); features file 85972 -> 85972 bytes
+- after:  exit 0 (ok); features file 86003 -> 86003 bytes
 
 ### pcap without flows
 - input:  netml learn -p arp_only.pcap
 - before: exit 1: [IndexError] index -1 is out of bounds for axis 0 with size 0
-- after:  exit 2: compare_before_after.py learn: error: no flows to extract features from: no TCP/UDP flow with at least 2 packets in /tmp/tmpctccizce/arp_only.pcap
+- after:  exit 2: compare_before_after.py learn: error: no flows to extract features from: no TCP/UDP flow with at least 2 packets in /tmp/tmpt11ah6ec/arp_only.pcap
 
 ### --param FILE
 - input:  --param params.yaml containing "nu: 0.2"
@@ -129,10 +129,10 @@ after:  /home/frank/netml (current code)
 
 ## 2. tests/bug_fix_tests/test_my_changes.py against each version
 
-- before: 113 tests: 14 pass, 54 fail, 45 error, 0 skip
-- after: 113 tests: 113 pass, 0 fail, 0 error, 0 skip
+- before: 129 tests: 15 pass, 68 fail, 46 error, 0 skip
+- after: 129 tests: 129 pass, 0 fail, 0 error, 0 skip
 
-### Fail before, pass after (99 tests)
+### Fail before, pass after (114 tests)
 
 | test | before | why it failed before |
 |---|---|---|
@@ -144,13 +144,28 @@ after:  /home/frank/netml (current code)
 | CLIContaminationTests.test_option_and_param_together_is_an_error | fail | AssertionError: '--contamination' not found in "usage: compare_before_after.py learn [-h] [-p FILE] [-l FILE]\n [--pcap-normal FILE]\n [--pcap-abnormal FILE] [-f FILE]\n [-o FILE]\n [--algorithm {o... |
 | CLIContaminationTests.test_out_of_range | fail | (value='0'): AssertionError: '--contamination' not found in "usage: compare_before_after.py learn [-h] [-p FILE] [-l FILE]\n [--pcap-normal FILE]\n [--pcap-abnormal FILE] [-f FILE]\n [-o FILE]\n [--algorithm {o... |
 | CLIContaminationTests.test_param_value_out_of_range | fail | AssertionError: 0 != 2 |
-| CLIContaminationTests.test_prints_value_and_meaning | fail | AssertionError: netml ('-v', '1', 'learn', '--algorithm', 'kde', '--contamination', '0.05', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '-o', '/tmp/tmpzd3otqna/model') exited ... |
+| CLIContaminationTests.test_prints_value_and_meaning | fail | AssertionError: netml ('-v', '1', 'learn', '--algorithm', 'kde', '--contamination', '0.05', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '-o', '/tmp/tmp4vhdrrzh/model') exited ... |
 | CLIContaminationTests.test_sets_every_algorithm | fail | (algorithm='ocsvm'): AssertionError: 2 != 0 : usage: compare_before_after.py learn [-h] [-p FILE] [-l FILE] [--pcap-normal FILE] [--pcap-abnormal FILE] [-f FILE] [-o FILE] [--algorithm {ocsvm,kde,if,ae,gmm,pca}] [--hel... |
+| CLIExtractionSettingsModeTests.test_common_length_classify_other_pcap | fail | AssertionError: netml ('-v', '0', 'learn', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '-o', '/tmp/tmphjc2a28m/test_common_length_classify_other_pcap-model', '--extraction-set... |
+| CLIExtractionSettingsModeTests.test_common_length_own_interval_shared_length | fail | AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmphjc2a28m/test_common_length_own_interval_shared_length-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10... |
+| CLIExtractionSettingsModeTests.test_default_is_shared | fail | AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmphjc2a28m/test_default_is_shared-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1... |
+| CLIExtractionSettingsModeTests.test_model_without_mode_is_shared | error | AttributeError: 'OCSVM' object has no attribute 'extraction_params' |
+| CLIExtractionSettingsModeTests.test_normal_only_classify_other_pcap | fail | AssertionError: netml ('-v', '0', 'learn', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '--pcap-abnormal', '/home/frank/netml/befor... |
+| CLIExtractionSettingsModeTests.test_normal_only_only_abnormal_falls_back_with_warning | fail | AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmphjc2a28m/test_normal_only_only_abnormal_falls_back_with_warning-features', '--pcap-abnormal', '/home/frank/netml/before_bug_fix/examples/da... |
+| CLIExtractionSettingsModeTests.test_normal_only_unlabeled_falls_back_with_warning | fail | AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmphjc2a28m/test_normal_only_unlabeled_falls_back_with_warning-features', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '-... |
+| CLIExtractionSettingsModeTests.test_normal_only_with_label_file | fail | AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmphjc2a28m/test_normal_only_with_label_file-features', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '-l', '/home/frank/n... |
+| CLIExtractionSettingsModeTests.test_normal_only_with_normal_and_abnormal_pcaps | fail | AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmphjc2a28m/test_normal_only_with_normal_and_abnormal_pcaps-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_... |
+| CLIExtractionSettingsModeTests.test_per_pcap_classify | fail | AssertionError: netml ('-v', '0', 'learn', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '-o', '/tmp/tmphjc2a28m/test_per_pcap_classify-model', '--extraction-settings', 'per-pca... |
+| CLIExtractionSettingsModeTests.test_per_pcap_several_pcaps_clear_error | fail | AssertionError: 'different lengths' not found in 'usage: compare_before_after.py [-h] [--tb] [-v INT]\n [--flow-pkts-threshold INT]\n [--q-interval FLOAT] [--random-state INT]\n {classify,learn} ..... |
+| CLIExtractionSettingsModeTests.test_per_pcap_several_pcaps_same_length_works | fail | AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmphjc2a28m/test_per_pcap_several_pcaps_same_length_works-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/demo.pca... |
+| CLIExtractionSettingsModeTests.test_per_pcap_single_pcap_works_with_warning | fail | AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmphjc2a28m/test_per_pcap_single_pcap_works_with_warning-features', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '--extra... |
+| CLIExtractionSettingsModeTests.test_prints_mode_and_meaning | fail | AssertionError: 'extraction settings: shared' not found in "pcap_file: <_io.BufferedReader name='/home/frank/netml/before_bug_fix/examples/data/demo.pcap'>\n" |
+| CLIExtractionSettingsModeTests.test_shared_explicit_equals_default | fail | AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmphjc2a28m/test_shared_explicit_equals_default-features', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '--extraction-set... |
 | CLIFeatureFileTests.test_bad_arguments_keep_existing_files | fail | AssertionError: b'' != b'\x80\x04\x95\x84\x00\x00\x00\x00\x00\x00\[313546 chars]x94.' |
 | CLIFeatureFileTests.test_extract_and_train_with_feature_file | error | AttributeError: 'OCSVM' object has no attribute 'extraction_params' |
 | CLIFeatureFileTests.test_failed_extract_keeps_existing_files | fail | AssertionError: b'' != b'\x80\x04\x95\x84\x00\x00\x00\x00\x00\x00\[313546 chars]x94.' |
-| CLIFeatureFileTests.test_train_from_old_feature_file | fail | AssertionError: netml ('learn', 'train', '-f', '/tmp/tmp424zkcj5/features', '-o', '/tmp/tmp424zkcj5/model') exited with 1: |
-| CLIFeatureFileTests.test_train_in_isolation | fail | AssertionError: netml ('learn', 'train', '-f', '/tmp/tmprhn2k788/features', '-o', '/tmp/tmprhn2k788/model') exited with 1: |
+| CLIFeatureFileTests.test_train_from_old_feature_file | fail | AssertionError: netml ('learn', 'train', '-f', '/tmp/tmptecq5wup/features', '-o', '/tmp/tmptecq5wup/model') exited with 1: |
+| CLIFeatureFileTests.test_train_in_isolation | fail | AssertionError: netml ('learn', 'train', '-f', '/tmp/tmpm_28tynk/features', '-o', '/tmp/tmpm_28tynk/model') exited with 1: |
 | CLIFeatureFileTests.test_train_missing_feature_file | fail | AssertionError: 1 != 2 |
 | CLIParamTests.test_param_file | fail | AssertionError: 1 != 0 : |
 | CLIParamTests.test_param_invalid_yaml | fail | AssertionError: 1 != 2 |
@@ -168,13 +183,13 @@ after:  /home/frank/netml (current code)
 | ExamplesTests.test_committed_demo_features_match_parser | fail | AssertionError: Arrays are not equal (shapes (88, 2), (88, 71) mismatch) ACTUAL: array([[0.000000e+00, 5.960464e-06], [0.000000e+00, 4.053116e-06], [0.000000e+00, 2.861023e-06],... DESIRED: array([... |
 | ExamplesTests.test_committed_example_outputs_load | error | (path='examples/out/data/OCSVM-results.dat'): ModuleNotFoundError: No module named 'ndm' |
 | ExamplesTests.test_demos_write_to_out_and_chain | fail | AssertionError: Lists differ: ['demo.csv', 'demo.pcap', 'demo_IAT.dat', 'demo_pandas.csv', 'srcIP_10.42.0.1'] != ['demo.csv', 'demo.pcap', 'srcIP_10.42.0.1'] First differing element 2: 'demo_IAT.da... |
-| ExamplesTests.test_ndm_demo_missing_input_clear_message | fail | AssertionError: 'pparser_demo.py' not found in 'Traceback (most recent call last):\n File "/tmp/tmp8dijw6ns/examples/ndm/ndm_demo.py", line 91, in <module>\n main()\n File "/tmp/tmp8dijw6ns/example... |
-| ExtractionSettingsCLITests.test_classify_other_pcap | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmprv4b_dcl/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
-| ExtractionSettingsCLITests.test_classify_with_old_model_file | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmprv4b_dcl/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
-| ExtractionSettingsCLITests.test_feature_file_still_unpacks_as_pair | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmprv4b_dcl/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
-| ExtractionSettingsCLITests.test_model_saves_settings | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmprv4b_dcl/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
-| ExtractionSettingsCLITests.test_multi_pcap_settings | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmprv4b_dcl/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
-| ExtractionSettingsCLITests.test_single_pcap_unchanged | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmprv4b_dcl/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
+| ExamplesTests.test_ndm_demo_missing_input_clear_message | fail | AssertionError: 'pparser_demo.py' not found in 'Traceback (most recent call last):\n File "/tmp/tmpcbi7bll1/examples/ndm/ndm_demo.py", line 91, in <module>\n main()\n File "/tmp/tmpcbi7bll1/example... |
+| ExtractionSettingsCLITests.test_classify_other_pcap | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmpctt8zw74/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
+| ExtractionSettingsCLITests.test_classify_with_old_model_file | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmpctt8zw74/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
+| ExtractionSettingsCLITests.test_feature_file_still_unpacks_as_pair | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmpctt8zw74/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
+| ExtractionSettingsCLITests.test_model_saves_settings | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmpctt8zw74/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
+| ExtractionSettingsCLITests.test_multi_pcap_settings | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmpctt8zw74/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
+| ExtractionSettingsCLITests.test_single_pcap_unchanged | error | setUpClass: AssertionError: netml ('learn', 'extract', '-f', '/tmp/tmpctt8zw74/multi-features', '--pcap-normal', '/home/frank/netml/before_bug_fix/examples/data/srcIP_10.42.0.1/srcIP_10.42.0.1_normal.pcap', '-... |
 | ExtractionSettingsLibraryTests.test_pcap2flows_with_interval | error | AttributeError: 'PCAP' object has no attribute 'q_interval' |
 | ExtractionSettingsLibraryTests.test_pkts_dim_fixes_feature_length | error | (feat_type='IAT'): TypeError: PCAP.flow2features() got an unexpected keyword argument 'pkts_dim' |
 | ExtractionSettingsLibraryTests.test_shared_interval_is_quantile_of_all_flows | error | AttributeError: 'PCAP' object has no attribute 'extract_flows' |
@@ -196,8 +211,8 @@ after:  /home/frank/netml (current code)
 | NetflixTests.test_lengths_match_wireshark | fail | AssertionError: Arrays are not equal Mismatched elements: 87199 / 141471 (61.6%) Max absolute difference among violations: 1314 Max relative difference among violations: 0.8678996 ACTUAL: array([77... |
 | NetflixTests.test_pipeline_with_header | error | AttributeError: proto |
 | NetflixTests.test_protocol_counts | fail | AssertionError: {'TCP[18 chars]232, None: 80, 'ICMP': 16} != {'TCP[18 chars]232, 'ICMPv6': 44, 'ARP': 26, 'ICMP': 16, 'IGM[13 chars]': 2} - {None: 80, 'ICMP': 16, 'TCP': 141143, 'UDP': 232} + {'ARP... |
-| NoFlowsTests.test_classify_empty_pcap | fail | AssertionError: netml ('classify', '-m', '/tmp/tmph1tn2pr5/model', '-p', '/tmp/tmph1tn2pr5/arp-only.pcap') exited with 1: |
-| NoFlowsTests.test_cli_empty_pcap_skipped_with_warning | fail | AssertionError: netml ('learn', 'extract', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '-p', '/tmp/tmph1tn2pr5/arp-only.pcap', '-f', '/tmp/tmph1tn2pr5/features-mixed') exited ... |
+| NoFlowsTests.test_classify_empty_pcap | fail | AssertionError: netml ('classify', '-m', '/tmp/tmphl0_xty_/model', '-p', '/tmp/tmphl0_xty_/arp-only.pcap') exited with 1: |
+| NoFlowsTests.test_cli_empty_pcap_skipped_with_warning | fail | AssertionError: netml ('learn', 'extract', '-p', '/home/frank/netml/before_bug_fix/examples/data/demo.pcap', '-p', '/tmp/tmphl0_xty_/arp-only.pcap', '-f', '/tmp/tmphl0_xty_/features-mixed') exited ... |
 | NoFlowsTests.test_cli_only_empty_pcap | fail | AssertionError: 1 != 2 |
 | NoFlowsTests.test_flow2features_without_flows_is_2d | error | AttributeError: 'PCAP' object has no attribute 'extract_flows' |
 | NoFlowsTests.test_label_file_matching_nothing_warns | fail | AssertionError: UserWarning not triggered |
@@ -240,6 +255,6 @@ after:  /home/frank/netml (current code)
 
 none
 
-### Pass in both versions (14 tests)
+### Pass in both versions (15 tests)
 
-Behaviour that was already right and is kept: CLIContaminationTests.test_param_value_used_when_option_not_given, CLIContaminationTests.test_quiet_at_verbosity_0, CLIParamTests.test_param_inline, CaptureExampleTests.test_capture_end_to_end, HttpRegressionTests.test_lengths_match_wireshark, HttpRegressionTests.test_wire_length_equals_captured_length, SubflowSplitTests.test_interval_not_split, SubflowSplitTests.test_interval_single_packet_tail_dropped, SubflowSplitTests.test_timeout_not_split, SubflowSplitTests.test_timeout_single_packet_tail_dropped, SyntheticTests.test_fixture_is_truncated, SyntheticTests.test_get_SAMP_NUM_unchanged, SyntheticTests.test_get_fid_ipv4_unchanged, SyntheticTests.test_header_features_ipv4_tcp
+Behaviour that was already right and is kept: CLIContaminationTests.test_param_value_used_when_option_not_given, CLIContaminationTests.test_quiet_at_verbosity_0, CLIExtractionSettingsModeTests.test_invalid_mode, CLIParamTests.test_param_inline, CaptureExampleTests.test_capture_end_to_end, HttpRegressionTests.test_lengths_match_wireshark, HttpRegressionTests.test_wire_length_equals_captured_length, SubflowSplitTests.test_interval_not_split, SubflowSplitTests.test_interval_single_packet_tail_dropped, SubflowSplitTests.test_timeout_not_split, SubflowSplitTests.test_timeout_single_packet_tail_dropped, SyntheticTests.test_fixture_is_truncated, SyntheticTests.test_get_SAMP_NUM_unchanged, SyntheticTests.test_get_fid_ipv4_unchanged, SyntheticTests.test_header_features_ipv4_tcp

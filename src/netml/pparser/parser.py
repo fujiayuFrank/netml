@@ -800,6 +800,18 @@ def _get_sampling_rate(flows):
     return _get_split_interval(_get_flow_durations(flows), q_interval=0.3)
 
 
+def get_flows_interval(flows, q_interval=0.9):
+    """Split interval computed from the given (not yet split) flows: the q_interval quantile of
+    their durations."""
+    return _get_split_interval(_get_flow_durations(flows), q_interval=q_interval)
+
+
+def get_flows_pkts_dim(flows, q_interval=0.9):
+    """Feature length computed from the given (sub)flows: the q_interval quantile of their
+    number of packets."""
+    return _get_pkts_dim(flows, q_interval)
+
+
 def get_shared_interval(pcaps, q_interval=0.9):
     """Split interval shared by several PCAPs: the q_interval quantile of the durations of all
     their (not yet split) flows. Call PCAP.extract_flows() on each PCAP first.
@@ -808,7 +820,7 @@ def get_shared_interval(pcaps, q_interval=0.9):
     by the same rule, whichever pcap it comes from.
     """
     all_flows = list(itertools.chain.from_iterable(pcap.raw_flows for pcap in pcaps))
-    return _get_split_interval(_get_flow_durations(all_flows), q_interval=q_interval)
+    return get_flows_interval(all_flows, q_interval)
 
 
 def get_shared_pkts_dim(pcaps, q_interval=0.9):
@@ -816,7 +828,32 @@ def get_shared_pkts_dim(pcaps, q_interval=0.9):
     per (sub)flow over all of them. Call PCAP.split_flows() (or pcap2flows()) on each PCAP first.
     """
     all_flows = list(itertools.chain.from_iterable(pcap.flows for pcap in pcaps))
-    return _get_pkts_dim(all_flows, q_interval)
+    return get_flows_pkts_dim(all_flows, q_interval)
+
+
+NORMAL_LABELS = ('BENIGN', 'NORMAL')
+
+
+def read_flow_labels(label_file, verbose=0):
+    """Read a label file (CICIDS_2017 format) into {fid: label}, with label 0 (normal: BENIGN or
+    NORMAL) or 1 (anything else). If a fid has several rows, the last one wins.
+
+    label_file: str (path) or file
+    """
+    csv = pd.read_csv(label_file)
+
+    true_labels = {}
+    for i, r in enumerate(csv.index):
+        if (verbose > 3) and (i % 10000 == 0):
+            print(f"Label CSV {i}th row")
+        row = csv.loc[r]
+        fid = (str(row[" Source IP"]), str(row[" Destination IP"]),
+               int(row[" Source Port"]), int(row[" Destination Port"]),
+               int(row[" Protocol"]))
+        # it will overwrite the previous label for the same fid.
+        true_labels[fid] = 0 if row[" Label"].upper() in NORMAL_LABELS else 1
+
+    return true_labels
 
 
 def _get_FFT_data(features, fft_bin='', fft_part='real'):
@@ -1155,33 +1192,7 @@ class PCAP:
         """
 
         if label_file:
-            NORMAL_LABELS = [v.upper() for v in ['benign'.upper(), 'normal'.upper()]]
-
-            # load CSV with pandas
-            csv = pd.read_csv(label_file)
-
-            true_labels = {}
-            cnt_anomaly = 0
-            cnt_nomral = 0
-
-            for i, r in enumerate(csv.index):
-                if (self.verbose > 3) and (i % 10000 == 0):
-                    print(f"Label CSV {i}th row")
-                row = csv.loc[r]
-                fid = (str(row[" Source IP"]), str(row[" Destination IP"]),
-                       int(row[" Source Port"]), int(row[" Destination Port"]),
-                       int(row[" Protocol"]))
-                # ensure all 5-tuple flows have same label
-                label_i = row[" Label"].upper()
-                if label_i in NORMAL_LABELS:
-                    label_i = 0
-                    cnt_nomral += 1
-                else:
-                    label_i = 1
-                    cnt_anomaly += 1
-
-                # it will overwrite the previous label for the same fid.
-                true_labels[fid] = label_i
+            true_labels = read_flow_labels(label_file, verbose=self.verbose)
 
             # label flows with ture_labels
             new_labels = []

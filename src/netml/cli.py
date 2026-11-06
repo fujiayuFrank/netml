@@ -39,6 +39,38 @@ class NoFlowsError(ValueError):
     """None of the given pcaps has a flow to extract features from."""
 
 
+class FeatureLengthError(ValueError):
+    """The pcaps' features have different lengths, so they cannot be combined."""
+
+
+# --extraction-settings: how the flow split interval and the feature length are chosen
+EXTRACTION_SETTINGS = {
+    'shared': 'one split interval and one feature length, computed from all flows of all the '
+              'pcaps',
+    'per-pcap': 'each pcap gets its own split interval and feature length (the original netml '
+                'behavior)',
+    'common-length': 'each pcap gets its own split interval; one feature length, computed from '
+                     'all flows of all the pcaps (shorter flows padded with 0, longer ones cut)',
+    'normal-only': 'one split interval and one feature length, computed from the normal-labeled '
+                   'flows only',
+}
+DEFAULT_EXTRACTION_SETTINGS = 'shared'
+
+PER_PCAP_WARNING = (
+    'warning: --extraction-settings per-pcap (the original netml behavior): each pcap gets its '
+    'own split interval and feature length, so the features of different pcaps usually have '
+    'different lengths: learn fails when it combines several pcaps, and classify fails on a pcap '
+    'other than the training one, unless the lengths happen to match. With one pcap per class, '
+    'the settings also differ by class. The default, --extraction-settings shared, avoids this.'
+)
+
+
+def _rewind(file):
+    """Go back to the start of an open file, so it can be read again (label files)."""
+    if hasattr(file, 'seek'):
+        file.seek(0)
+
+
 # interface for setup.py
 
 def execute():
@@ -124,13 +156,15 @@ class Command(argcmdr.Command):
     # TODO: support specification of remaining feature types
     feat_type = 'IAT'
 
-    def extract_pcaps(self, pcap_file_labels, params=None):
-        """Parse PCAP files and extract their flows and features, with shared settings.
+    def extract_pcaps(self, pcap_file_labels, params=None, mode=None):
+        """Parse PCAP files and extract their flows and features.
 
-        All pcaps are split into subflows with one interval, and their features are fixed to one
-        length, so features from different pcaps are comparable (and can be concatenated). These
-        settings are computed from the flows of all the given pcaps, unless they are given in
-        "params" (e.g. the settings a model was trained with).
+        How the split interval and the feature length are chosen depends on the mode (see
+        EXTRACTION_SETTINGS). By default ("shared"), all pcaps are split into subflows with one
+        interval, and their features are fixed to one length, so features from different pcaps
+        are comparable (and can be concatenated). These settings are computed from the flows of
+        all the given pcaps, unless they are given in "params" (e.g. the settings a model was
+        trained with).
 
         Labels, for model-testing, are applied if specified.
 
@@ -140,7 +174,12 @@ class Command(argcmdr.Command):
             label_kwargs: dict with optional "label" or "label_file" (see PCAP.label_flows)
 
         params: dict (default is None)
-            optional "feat_type", "interval" and "pkts_dim"; missing or None values are computed
+            optional "extraction_settings", "feat_type", "interval" and "pkts_dim"; missing or
+            None values are computed
+
+        mode: str (default is None)
+            a key of EXTRACTION_SETTINGS, used if params has no "extraction_settings";
+            by default "shared"
 
         Returns
         -------
@@ -151,6 +190,7 @@ class Command(argcmdr.Command):
 
         """
         params = dict(params or {})
+        mode = params.get('extraction_settings') or mode or DEFAULT_EXTRACTION_SETTINGS
         q_interval = params.get('q_interval', self.args.q_interval)
         feat_type = params.get('feat_type', self.feat_type)
         min_pkts = self.args.flow_pkts_threshold
@@ -181,19 +221,35 @@ class Command(argcmdr.Command):
             raise NoFlowsError(f'no flows to extract features from: no TCP/UDP flow with at least '
                                f'{min_pkts} packets in {", ".join(all_names)}')
 
-        # 2. split them into subflows with one shared interval
+        # 2. split them into subflows: one interval for all pcaps, or one per pcap
         interval = params.get('interval')
-        if interval is None:
-            interval = netml.pparser.parser.get_shared_interval(pcaps, q_interval)
+        settings_flows = None  # normal-only: whether the normal flows or all flows were used
+        if interval is None and mode in ('per-pcap', 'common-length'):
+            intervals = [netml.pparser.parser.get_flows_interval(pcap.raw_flows, q_interval)
+                         for pcap in pcaps]
+        else:
+            if interval is None and mode == 'normal-only':
+                normal_flows = self.normal_raw_flows(pcaps, pcap_label_kwargs)
+                settings_flows = 'normal' if normal_flows else 'all'
+                if normal_flows:
+                    interval = netml.pparser.parser.get_flows_interval(normal_flows, q_interval)
+                else:
+                    print('warning: --extraction-settings normal-only: no normal-labeled flows '
+                          '(label pcaps with --pcap-normal, or -p with -l); the settings are '
+                          'computed from all flows instead, as with "shared"', file=sys.stderr)
+            if interval is None:
+                interval = netml.pparser.parser.get_shared_interval(pcaps, q_interval)
+            intervals = [interval] * len(pcaps)
 
-        for (pcap, label_kwargs) in zip(pcaps, pcap_label_kwargs):
-            pcap.split_flows(interval)
+        for (pcap, label_kwargs, pcap_interval) in zip(pcaps, pcap_label_kwargs, intervals):
+            pcap.split_flows(pcap_interval)
             pcap.raw_flows = None  # not needed anymore
 
             # label each flow
             label = label_kwargs.get('label')
             label_file = label_kwargs.get('label_file')
             if label is not None or label_file is not None:
+                _rewind(label_file)  # (normal-only may have read it already)
                 pcap.label_flows(label_file=label_file, label=label)
 
         # pcaps left without flows: subflows too short, or none matched the label file
@@ -201,27 +257,72 @@ class Command(argcmdr.Command):
         for name in empty_names:
             print(f'warning: no flow of {name} is left after splitting and labeling '
                   '(see any warning above): skipped', file=sys.stderr)
-        pcaps = [pcap for pcap in pcaps if pcap.flows]
+        kept = [i for (i, pcap) in enumerate(pcaps) if pcap.flows]
+        pcaps = [pcaps[i] for i in kept]
+        intervals = [intervals[i] for i in kept]
 
         if not pcaps:
             raise NoFlowsError(f'no flows to extract features from: none is left after splitting '
                                f'and labeling, in {", ".join(all_names)}')
 
-        # 3. extract features with one shared feature length
+        # 3. extract features: one feature length for all pcaps, or one per pcap
         pkts_dim = params.get('pkts_dim')
-        if pkts_dim is None:
-            pkts_dim = netml.pparser.parser.get_shared_pkts_dim(pcaps, q_interval)
+        if pkts_dim is None and mode == 'per-pcap':
+            pkts_dims = [netml.pparser.parser.get_flows_pkts_dim(pcap.flows, q_interval)
+                         for pcap in pcaps]
+        else:
+            if pkts_dim is None and settings_flows == 'normal':
+                normal_flows = [flow
+                                for pcap in pcaps if pcap.labels is not None
+                                for (flow, label) in zip(pcap.flows, pcap.labels)
+                                if label == LABEL_NORMAL]
+                if normal_flows:
+                    pkts_dim = netml.pparser.parser.get_flows_pkts_dim(normal_flows, q_interval)
+                else:
+                    print('warning: --extraction-settings normal-only: no normal-labeled flow is '
+                          'left after splitting; the feature length is computed from all flows '
+                          'instead', file=sys.stderr)
+            if pkts_dim is None:
+                pkts_dim = netml.pparser.parser.get_shared_pkts_dim(pcaps, q_interval)
+            pkts_dims = [pkts_dim] * len(pcaps)
 
-        for pcap in pcaps:
-            pcap.flow2features(feat_type, fft=False, header=False, pkts_dim=pkts_dim)
+        for (pcap, pcap_pkts_dim) in zip(pcaps, pkts_dims):
+            pcap.flow2features(feat_type, fft=False, header=False, pkts_dim=pcap_pkts_dim)
 
+        names = [_pcap_name(pcap.pcap_file) for pcap in pcaps]
         params_used = {
+            'extraction_settings': mode,
             'feat_type': feat_type,
             'q_interval': q_interval,
-            'interval': float(interval),
-            'pkts_dim': int(pkts_dim),
+            # None: computed for each pcap (per-pcap, common-length), also in classify
+            'interval': None if mode in ('per-pcap', 'common-length') else float(interval),
+            'pkts_dim': None if mode == 'per-pcap' else int(pkts_dim),
         }
+        if mode in ('per-pcap', 'common-length'):
+            params_used['intervals'] = {name: float(value)
+                                        for (name, value) in zip(names, intervals)}
+        if mode == 'per-pcap':
+            params_used['pkts_dims'] = {name: int(value) for (name, value) in zip(names, pkts_dims)}
+        if mode == 'normal-only':
+            params_used['settings_flows'] = settings_flows or 'given'
         return (pcaps, params_used)
+
+    @staticmethod
+    def normal_raw_flows(pcaps, pcap_label_kwargs):
+        """The (not yet split) flows labeled normal: all flows of pcaps labeled normal (e.g.
+        --pcap-normal), and the flows a label file marks as normal. Unlabeled pcaps add none."""
+        normal_flows = []
+        for (pcap, label_kwargs) in zip(pcaps, pcap_label_kwargs):
+            label = label_kwargs.get('label')
+            label_file = label_kwargs.get('label_file')
+            if label_file is not None:
+                _rewind(label_file)
+                flow_labels = netml.pparser.parser.read_flow_labels(label_file)
+                normal_flows.extend((fid, pkts) for (fid, pkts) in pcap.raw_flows
+                                    if flow_labels.get(fid) == LABEL_NORMAL)
+            elif label == LABEL_NORMAL:
+                normal_flows.extend(pcap.raw_flows)
+        return normal_flows
 
     @staticmethod
     def get_model_params(model):
@@ -350,9 +451,12 @@ class Classify(Command):
         (model, train_history) = load_data(args.model)
 
         # extract features with the same settings the model was trained with
+        model_params = self.get_model_params(model)
+        per_pcap = (model_params or {}).get('extraction_settings') == 'per-pcap'
+        if per_pcap:
+            print(PER_PCAP_WARNING, file=sys.stderr)
         try:
-            ((pcap,), _params) = self.extract_pcaps([(pcap_file, {})],
-                                                    params=self.get_model_params(model))
+            ((pcap,), _params) = self.extract_pcaps([(pcap_file, {})], params=model_params)
         except NoFlowsError as exc:
             # not an error for classify: there is simply nothing to report
             print(f'warning: {exc}; nothing to classify', file=sys.stderr)
@@ -362,6 +466,10 @@ class Classify(Command):
         try:
             is_anomaly = netml.ndm.model.predict_anomalies(model, pcap.features)
         except ValueError as exc:
+            if per_pcap:
+                parser.error(f'{exc} (the model was trained with --extraction-settings per-pcap, '
+                             'so this pcap got its own feature length; retrain the model with '
+                             'the default, --extraction-settings shared)')
             parser.error(str(exc))
 
         for ((flow_key, flow_packets), anomaly) in zip(pcap.flows, is_anomaly):
@@ -488,6 +596,17 @@ class Learn(Command):
             type=pathlib.Path,
             help="path at which to store trained model "
                  f'(required to "{self.action_train}")',
+        )
+
+        feature_modeling.add_argument(
+            '--extraction-settings',
+            choices=tuple(EXTRACTION_SETTINGS),
+            default=DEFAULT_EXTRACTION_SETTINGS,
+            help="how the flow split interval and the feature length are chosen: "
+                 + "; ".join(f"{name}: {meaning}"
+                             for (name, meaning) in EXTRACTION_SETTINGS.items())
+                 + f" (default: {DEFAULT_EXTRACTION_SETTINGS}). classify uses the settings the "
+                 "model was trained with",
         )
 
         model_params = parser.add_argument_group(
@@ -619,7 +738,7 @@ class Learn(Command):
                             zip(pcaps_abnormal, labels_abnormal),
                         ),
                     )
-                except NoFlowsError as exc:
+                except (NoFlowsError, FeatureLengthError) as exc:
                     parser.error(str(exc))
 
                 # written only now that extraction succeeded
@@ -644,10 +763,25 @@ class Learn(Command):
         #
         # NOTE: features are not scaled/normalized; a scaler would have to be fit on the training
         # NOTE: data and saved with the model, like the extraction settings.
-        (pcaps, params) = self.extract_pcaps(pcap_file_labels)
+        mode = self.args.extraction_settings
+        self.vprint(1, f'extraction settings: {mode}: {EXTRACTION_SETTINGS[mode]} '
+                       '(set with --extraction-settings)')
+        if mode == 'per-pcap':
+            print(PER_PCAP_WARNING, file=sys.stderr)
+
+        (pcaps, params) = self.extract_pcaps(pcap_file_labels, mode=mode)
 
         if not pcaps:
             raise ValueError("nothing to extract")
+
+        widths = {pcap.features.shape[1] for pcap in pcaps}
+        if len(widths) > 1:
+            lengths = ', '.join(f'{_pcap_name(pcap.pcap_file)}: {pcap.features.shape[1]}'
+                                for pcap in pcaps)
+            raise FeatureLengthError(
+                f'the features of the pcaps have different lengths ({lengths}), so they cannot be '
+                f'combined: with --extraction-settings {mode}, each pcap gets its own feature '
+                f'length; use the default, --extraction-settings shared (or common-length)')
 
         features = np.concatenate([pcap.features for pcap in pcaps])
 

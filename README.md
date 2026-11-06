@@ -371,6 +371,28 @@ This section lists the fixes and changes made to `pparser` (`src/netml/pparser/p
     * A new `learn --contamination FRACTION` option, in (0, 0.5], default 0.1: the expected fraction of anomalies. `classify` will flag about this fraction of the flows that are similar to the training data. It sets `contamination` for the pyod-based models and `nu` for OCSVM, so it means the same for every algorithm.
     * At the default verbosity, `learn` prints the value and its meaning, e.g. `contamination 0.1 (kde: contamination=0.1): classify will flag about 10% of flows similar to the training data (set with --contamination)`.
     * `--param` can still set `contamination` / `nu` directly (then that value is used), but not together with `--contamination`.
+* **How the extraction settings are chosen can now be selected: `learn --extraction-settings MODE`.**
+  * **Problem:** the shared split interval and feature length (see [design decision 4](#4-several-pcaps-in-the-cli-one-shared-split-interval-and-feature-length)) were the only behavior. The original per-pcap behavior could not be reproduced, and the two alternatives weighed there could not be tried.
+  * **Fix:** four modes, default `shared`:
+
+    | Mode | Split interval | Feature length | `classify` with such a model |
+    |---|---|---|---|
+    | `shared` (default) | one, from all flows of all pcaps | one, from all flows | the saved values |
+    | `per-pcap` (the original netml behavior) | each pcap its own | each pcap its own | computes both from the pcap: works only if the length happens to match the model's |
+    | `common-length` | each pcap its own | one, from all (sub)flows; shorter flows padded with 0, longer ones cut | interval from the pcap, the saved feature length |
+    | `normal-only` | one, from the normal-labeled flows | one, from the normal-labeled subflows | the saved values |
+
+    * Normal-labeled flows are the flows of `--pcap-normal` pcaps, and the flows a `-l` label file marks `BENIGN` / `NORMAL` (read once more before labeling).
+    * The mode and the values used are saved in the features file and the model (`extraction_settings`; per-pcap values in `intervals` / `pkts_dims`; `settings_flows` for `normal-only`). Files made before this change have no mode and are treated as `shared`.
+    * At the default verbosity, `learn` prints the mode and its meaning, e.g. `extraction settings: shared: one split interval and one feature length, computed from all flows of all the pcaps (set with --extraction-settings)`.
+  * **Warnings and errors:**
+    * `per-pcap` always prints a warning, in `learn` and in `classify`: features of different pcaps usually have different lengths, so combining several pcaps, or classifying a pcap other than the training one, fails unless the lengths happen to match; with one pcap per class, the settings also differ by class.
+    * When it does fail, the error names each pcap with its feature length and suggests the default, instead of numpy's `all the input array dimensions … must match exactly`. Example: `srcIP_10.42.0.1_normal.pcap: 12, demo.pcap: 51`. No features file is written.
+    * Note: after the flow-splitting fixes, the example normal and anomaly pcaps both get feature length 13 on their own, so `per-pcap` happens to work for that pair (in the original code it was 12 vs. 13).
+    * `classify` with a `per-pcap` model on a pcap of another feature length: the usual `the model expects N features per flow, but got M` error, plus the reason and the fix (retrain with `shared`).
+    * `normal-only` with no normal-labeled flows (unlabeled `-p` input, or only `--pcap-abnormal`): a warning, and the settings are computed from all flows, as with `shared` (`settings_flows: 'all'`).
+  * New in `netml.pparser.parser`: `get_flows_interval(flows, q_interval)` and `get_flows_pkts_dim(flows, q_interval)` (the settings computed from any list of flows; `get_shared_*` now use them), and `read_flow_labels(label_file)`, which reads a label file into `{fid: 0 or 1}`. `PCAP.label_flows()` now uses it, with the same result.
+  * Tests: `CLIExtractionSettingsModeTests` (16 tests) in `tests/bug_fix_tests/test_my_changes.py`.
 * **A pcap without TCP/UDP flows crashed with numpy errors**: `IndexError: index -1 is out of bounds…` on its own, or a `ValueError` about array dimensions together with other pcaps.
   * The CLI now skips such a pcap, with a warning, and stops with a clear error if no pcap has a flow.
   * In the library, `pcap2flows()` raises `ValueError('no flows: …')`, and `flow2features()` on a pcap without flows returns an empty 2-D array (0 rows), which can be concatenated with others.
@@ -415,6 +437,10 @@ Situations that are likely to be mistakes now produce a message instead of a cra
 | `--param` with `random_state` | error: use `--random-state` |
 | `--contamination` (or `--param` `contamination` / `nu`) not in (0, 0.5], e.g. 0 | error: `must be a fraction in (0, 0.5] … (0 would flag almost nothing …)` |
 | `--contamination` together with `--param` `contamination` / `nu` | error: `… both set …: set it once` |
+| `--extraction-settings per-pcap` (in `learn`, and in `classify` with such a model) | warning: features of different pcaps usually have different lengths, so `learn` with several pcaps and `classify` on another pcap fail unless the lengths match |
+| `--extraction-settings per-pcap` with pcaps whose feature lengths differ | error: `the features of the pcaps have different lengths (a.pcap: 12, b.pcap: 51), so they cannot be combined …`; before (original netml), a numpy error |
+| `classify` with a `per-pcap` model on a pcap of another feature length | error: `the model expects N features per flow, but got M (the model was trained with --extraction-settings per-pcap …; retrain …)` |
+| `--extraction-settings normal-only` without normal-labeled flows | warning: the settings are computed from all flows instead |
 
 Errors go to standard error and exit with status 2, like other command-line errors.
 
@@ -509,14 +535,14 @@ Measured on `http.pcap` and `netflix.pcap` against the previous version:
 * `tests/bug_fix_tests/test_my_changes.py` covers all the above: synthetic pcaps with exact expected values, plus real pcaps.
   * Run it with `python tests/bug_fix_tests/test_my_changes.py`, or `python tests/bug_fix_tests/test_my_changes.py SyntheticTests` for the fast tests only (or `python -m unittest tests.bug_fix_tests.test_my_changes` from the repository root).
   * The real-pcap tests look for data in `/home/frank/ml-systems/docs/notebooks/data/` and are skipped if it is missing.
-* Run all the tests (the CLI tests and the bug-fix tests: 129) from the repository root with `python -m unittest`, which is what `tox` runs, or only the CLI tests with `python -m unittest discover -s tests/cli_tests -t .`. They need the `cli` extras: `pip install -e .[cli]`.
+* Run all the tests (the CLI tests and the bug-fix tests: 145) from the repository root with `python -m unittest`, which is what `tox` runs, or only the CLI tests with `python -m unittest discover -s tests/cli_tests -t .`. They need the `cli` extras: `pip install -e .[cli]`.
 
 **Before/after comparison**
 
 * `before_bug_fix/` holds the original code (git commit `106d5a1`: upstream netml 0.7.1 plus a `.gitignore` change; exported with `git archive 106d5a1 | tar -x -C before_bug_fix`) and, in `before_bug_fix/tests/bug_fix_tests/`, a copy of `test_my_changes.py` (the same relative path as in the current code, so the file finds each version's `examples/`).
 * `python tests/bug_fix_tests/compare_before_after.py` (from any directory) runs the same things against both versions, each in its own process with `PYTHONPATH=<version>/src`, so each imports its own netml (the script checks this):
   1. **Behaviour cases:** one small input per bug (mostly synthetic pcaps built by the script), and both outputs side by side. Examples: snaplen-truncated packets give lengths `[200, 200, 200]` before and `[1054, 1054, 1054]` after; IF on the same data gives AUC 0.004 before and 0.996 after; `capture()` on three packets raises `RuntimeError` before. 24 of 24 cases differ.
-  2. **Tests:** `test_my_changes.py` against each version, with the reason each test failed before. Before: 14 of 113 pass; after: 113 of 113. No test passes before and fails after.
+  2. **Tests:** `test_my_changes.py` against each version, with the reason each test failed before. Before: 15 of 129 pass; after: 129 of 129. No test passes before and fails after.
 * Run it in the netml development environment (`conda activate netml-dev`): the workers use the same Python as the script. With another Python it stops with a message naming the missing packages, or naming the crash if a compiled package fails (e.g. the base Python 3.14 environment segfaults inside pandas).
 * `--cases-only` runs only the cases (about 30 s; with the tests about 3.5 minutes). `--report tests/bug_fix_tests/compare_report.md` also saves the output as markdown (the committed report was made this way).
 * To let the same test file run against the original code, `test_my_changes.py` imports `predict_anomalies` and `FeatureData` (which the original lacks) through a fallback that only fails the tests using them, and `test_committed_example_outputs_load` checks every file in `examples/out/data/` when `git ls-files` finds none (the snapshot is not tracked).
@@ -582,6 +608,8 @@ Each decision lists the choice made, the main alternatives, and their pros and c
 * Cons: `protocol` describes the inner packet while `ip_src` / `ip_dst` describe the outer one. Labeling by the outer header (`GRE`) would be consistent, but would change existing labels.
 
 ### 4. Several pcaps in the CLI: one shared split interval and feature length
+
+(Since then, the original behavior and the last two alternatives below can be selected with `learn --extraction-settings`; `shared` stays the default. See [design decision 20](#20---extraction-settings-the-alternatives-as-options-shared-by-default).)
 
 * **Chosen: compute both from all flows of all input pcaps, and save them with the model.**
   * Pros:
@@ -855,6 +883,26 @@ When trained on all flows (normal and anomaly, as `netml learn` does), 0 caught 
   * Cons: the "before" column could not be reproduced or extended with new cases.
 
 
+### 20. `--extraction-settings`: the alternatives as options, shared by default
+
+* **Chosen: one option with four choices (`shared`, `per-pcap`, `common-length`, `normal-only`), default `shared`; the mode is saved with the features and the model, and `classify` follows it.**
+  * Pros: the default never crashes; the original behavior can still be reproduced (e.g. to compare with published results); the alternatives can be compared on real data; one option makes the choices mutually exclusive by construction; the saved mode keeps `classify` consistent with training.
+  * Cons: more code paths to test (16 more tests); `per-pcap` keeps a known way to fail, so it needs warnings.
+* **Alternative: separate flags (`--per-pcap-settings`, `--pad-only`, `--normal-only-settings`).**
+  * Pros: each flag reads as a switch.
+  * Cons: combinations that make no sense (`--per-pcap-settings --normal-only-settings`) must be rejected one by one.
+* **`per-pcap` failures: a clear error, not the original numpy crash.**
+  * Pros: the user learns why (each pcap's feature length is listed) and what to do (use `shared`); no features file is written.
+  * Cons: not byte-for-byte the original behavior; but the original "behavior" here was only an exception, and when the lengths match the features are exactly the original ones.
+  * Alternative: refuse `per-pcap` with several pcaps. Rejected: it works when the lengths happen to match, as in the original code.
+* **`common-length`: the feature length is computed from all (sub)flows, after each pcap is split by its own interval.**
+  * Pros: the same quantile rule as `shared`, so only the interval differs between the two modes.
+  * Alternative: the longest per-pcap length (pad everything). Cons: one pcap with long flows makes every other pcap's features mostly zeros.
+* **`normal-only` without normal-labeled flows: fall back to all flows, with a warning.**
+  * Pros: unlabeled input still works (e.g. `-p` without `-l`), and the user is told.
+  * Alternative: an error. Cons: the same command would fail or not depending on the labels.
+
+
 ## To Do
 
 Further work includes:
@@ -871,7 +919,6 @@ Further work includes:
   - scale features: fit a scaler on the training data and save it with the model, like the extraction settings;
   - choose the feature type in the CLI (`--feature-type`, `--fft`, `--header`); only `IAT` is extracted now;
   - offer fixed-length time windows as an alternative to the idle-time `interval` split (see [design decision 7](#7-flow-splitting-keep-the-last-subflow-keep-the-meaning-of-interval));
-  - optionally compute the shared extraction settings from normal-labeled flows only (see [design decision 4](#4-several-pcaps-in-the-cli-one-shared-split-interval-and-feature-length)).
 - `pcap2pandas()`: optional `layers`, `ip_proto` and `ethertype` columns; an option to label tunneled packets by their outer protocol (see [design decision 3](#3-protocol-labels-explicit-list-then-protocol-number-then-none)).
 - CLI:
   - a stratified train/test split, and an option to train on normal flows only (see [design decision 15](#15-labels-of-one-class-warn-and-skip-the-test));
