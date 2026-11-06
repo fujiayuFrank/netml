@@ -273,6 +273,12 @@ pcap processing (feature extraction)
 common functions (such as `load_data` and `dump_data`)
 - `tests/`\
 test cases
+  - `tests/cli_tests/`\
+  the original CLI tests
+  - `tests/bug_fix_tests/`\
+  tests of the November 2026 bug fixes (`test_my_changes.py`), and the before/after comparison (`compare_before_after.py`, which writes `compare_report.md`)
+- `before_bug_fix/`\
+the original code (upstream netml 0.7.1), used by the before/after comparison
 - `LICENSE.txt`
 - `manage.py`\
 library development & management module
@@ -335,7 +341,7 @@ This section lists the fixes and changes made to `pparser` (`src/netml/pparser/p
   * **Problem:**
     * `time` held scapy `EDecimal` objects in an `object` column, so `time_normed` held `Decimal`s.
     * `datetime` was cut to whole seconds and given in the local time zone of the machine running the code, so the same pcap gave different values on different machines.
-    * `time_normed` was measured from the first row, which is not always the earliest packet. It was computed with one `.iloc` lookup per row (slow), and it crashed on an empty pcap.
+    * `time_normed` was measured from the first row, which is not always the earliest packet. It was computed with one `.iloc` lookup per row (slow).
   * **Fix:**
     * `time` is a float, in seconds since the epoch.
     * `datetime` is a timezone-aware UTC timestamp with the full precision stored in the pcap (dtype `datetime64[ns, UTC]`). It is computed exactly from the pcap's decimal timestamp, not through a float.
@@ -483,7 +489,7 @@ Measured on `http.pcap` and `netflix.pcap` against the previous version:
   * the same 1279 scapy layers are loaded, and the imported names are the same objects as before;
   * flows, header features, all 11 feature types and the `pcap2pandas()` DataFrame are identical on 4 pcaps, and all tests pass.
 * **One difference for code outside netml:** names that only came in through `from scapy.all import *` (e.g. `rdpcap`) can no longer be imported from `netml.pparser.parser`; import them from scapy instead. Nothing in netml did this.
-* **Tests and examples** (`tests/`, `examples/`, `test_my_changes.py`) are also flake8-clean (0 warnings with flake8 3.8.3 and 7.5). They were also checked with two common flake8 plugins: pep8-naming (PEP 8 naming conventions) and flake8-bugbear (error-prone patterns, which found nothing).
+* **Tests and examples** (`tests/`, including `tests/bug_fix_tests/test_my_changes.py`, and `examples/`) are also flake8-clean (0 warnings with flake8 3.8.3 and 7.5). They were also checked with two common flake8 plugins: pep8-naming (PEP 8 naming conventions) and flake8-bugbear (error-prone patterns, which found nothing).
   * Fixed:
     * long lines and a missing space around an operator;
     * a test helper named like a constant (`ETHER()` → `ether()`);
@@ -500,10 +506,22 @@ Measured on `http.pcap` and `netflix.pcap` against the previous version:
 
 **Tests**
 
-* `test_my_changes.py` (repository root) covers all the above: synthetic pcaps with exact expected values, plus real pcaps.
-  * Run it with `python test_my_changes.py`, or `python test_my_changes.py SyntheticTests` for the fast tests only.
+* `tests/bug_fix_tests/test_my_changes.py` covers all the above: synthetic pcaps with exact expected values, plus real pcaps.
+  * Run it with `python tests/bug_fix_tests/test_my_changes.py`, or `python tests/bug_fix_tests/test_my_changes.py SyntheticTests` for the fast tests only (or `python -m unittest tests.bug_fix_tests.test_my_changes` from the repository root).
   * The real-pcap tests look for data in `/home/frank/ml-systems/docs/notebooks/data/` and are skipped if it is missing.
-* Run the CLI tests with `python -m unittest discover -s tests -t .`. They need the `cli` extras: `pip install -e .[cli]`.
+* Run all the tests (the CLI tests and the bug-fix tests: 129) from the repository root with `python -m unittest`, which is what `tox` runs, or only the CLI tests with `python -m unittest discover -s tests/cli_tests -t .`. They need the `cli` extras: `pip install -e .[cli]`.
+
+**Before/after comparison**
+
+* `before_bug_fix/` holds the original code (git commit `106d5a1`: upstream netml 0.7.1 plus a `.gitignore` change; exported with `git archive 106d5a1 | tar -x -C before_bug_fix`) and, in `before_bug_fix/tests/bug_fix_tests/`, a copy of `test_my_changes.py` (the same relative path as in the current code, so the file finds each version's `examples/`).
+* `python tests/bug_fix_tests/compare_before_after.py` (from any directory) runs the same things against both versions, each in its own process with `PYTHONPATH=<version>/src`, so each imports its own netml (the script checks this):
+  1. **Behaviour cases:** one small input per bug (mostly synthetic pcaps built by the script), and both outputs side by side. Examples: snaplen-truncated packets give lengths `[200, 200, 200]` before and `[1054, 1054, 1054]` after; IF on the same data gives AUC 0.004 before and 0.996 after; `capture()` on three packets raises `RuntimeError` before. 24 of 24 cases differ.
+  2. **Tests:** `test_my_changes.py` against each version, with the reason each test failed before. Before: 14 of 113 pass; after: 113 of 113. No test passes before and fails after.
+* Run it in the netml development environment (`conda activate netml-dev`): the workers use the same Python as the script. With another Python it stops with a message naming the missing packages, or naming the crash if a compiled package fails (e.g. the base Python 3.14 environment segfaults inside pandas).
+* `--cases-only` runs only the cases (about 30 s; with the tests about 3.5 minutes). `--report tests/bug_fix_tests/compare_report.md` also saves the output as markdown (the committed report was made this way).
+* To let the same test file run against the original code, `test_my_changes.py` imports `predict_anomalies` and `FeatureData` (which the original lacks) through a fallback that only fails the tests using them, and `test_committed_example_outputs_load` checks every file in `examples/out/data/` when `git ls-files` finds none (the snapshot is not tracked).
+* `before_bug_fix/` is not a Python package, so `python -m unittest` and `tox` do not pick up its tests; `tests/bug_fix_tests/` is (it has an `__init__.py`), so they run the current bug-fix tests.
+* Correction found with it: the original `pcap2pandas()` did *not* crash on an empty pcap (with no rows, its per-row `time_normed` lambda never runs); the entry above and the test docstring were corrected. The bug was that `time_normed` was measured from the first row: packets stored at 10, 5, 12 s gave `[0, -5, 2]` instead of `[5, 0, 7]`.
 
 ### Known limitations (not changed)
 
@@ -824,6 +842,19 @@ When trained on all flows (normal and anomaly, as `netml learn` does), 0 caught 
   * Cons: protocols whose layers are no longer loaded would stop being decoded, changing results silently (e.g. TCP inside PPPoE). It would need a careful audit of every encapsulation.
 
 
+### 19. Before/after comparison: a copy of the original code in the repository
+
+* **Chosen: `before_bug_fix/`, a plain copy of commit `106d5a1`, and `compare_before_after.py`, which imports each version in a separate process through `PYTHONPATH`.**
+  * Pros: anyone (a teammate, a grader) can see and run the original code without git commands; the comparison is one command; separate processes guarantee that the two versions never mix in one interpreter.
+  * Cons: about 11 MB of duplicated files, mostly the example pcaps; the test file is duplicated too, so it has to be copied again after each change (`cp tests/bug_fix_tests/test_my_changes.py before_bug_fix/tests/bug_fix_tests/`).
+* **Alternative: a temporary `git worktree` of `106d5a1`, created by the script.**
+  * Pros: no duplicated files in the repository; always exactly the commit.
+  * Cons: needs git and the full history; the original code is not visible in the repository for review.
+* **Alternative: run the tests once and keep only the recorded results.**
+  * Pros: fast; nothing to keep in sync.
+  * Cons: the "before" column could not be reproduced or extended with new cases.
+
+
 ## To Do
 
 Further work includes:
@@ -831,8 +862,7 @@ Further work includes:
 - Evaluate `pparser` performance on different pcaps\
 (November 2026: results checked on 8 real pcaps and on synthetic pcaps covering IPv6, VLAN, raw-IP and Linux "cooked" captures; runtime compared on `http.pcap` and `netflix.pcap`. Still to do: other capture types, e.g. pcapng and 802.11.)
 - Add test cases\
-(November 2026: `test_my_changes.py` covers the [changes above](#changes-november-2026). Still to do:
-  - move it into `tests/`, so that `tox` runs it;
+(November 2026: `tests/bug_fix_tests/test_my_changes.py` covers the [changes above](#changes-november-2026), and `tox` runs it. Still to do:
   - replace the real pcaps it reads from outside the repository with small ones in `examples/data/`;
   - use smaller pcaps to speed up `tests/cli_tests`.)
 - Add examples
