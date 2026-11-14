@@ -273,6 +273,8 @@ test cases
   tests of the five bug fixes (see [Bug fixes](#bug-fixes-november-2026))
   - `tests/data/`\
   all the data the tests read (course captures and netml's example pcaps)
+  - `tests/before_bug_fix/`\
+  the original netml library (before the bug fixes), for the before/after comparison
 - `LICENSE.txt`
 - `manage.py`\
 library development & management module
@@ -283,6 +285,8 @@ library development & management module
 
 
 ## Bug fixes (November 2026)
+
+*The full write-up of this work, with the evidence for each fix, is in [REPORT.md](REPORT.md).*
 
 Five bugs are fixed. Each fix is marked in the code with a comment starting `Bug fix (N/5)`, and tested in `tests/bug_fix_tests/test_N_*.py` by synthetic pcaps with exact expected values and by real captures from the course. Every test documents in its docstring what it checks, the expected result, and the result before the fix.
 
@@ -295,6 +299,8 @@ Five bugs are fixed. Each fix is marked in the code with a comment starting `Bug
 | 5 | **Isolation Forest ranked anomalies backwards (AUC < 0.5).** pyod's `IForest` already turns scikit-learn's scores round so that outliers score higher; netml's `IF` turned them round again. | pyod's scores are returned as they are. | `IF.decision_function()`, and the AUC `netml learn --algorithm if` reports |
 
 ### Running the tests
+
+Run the tests in an environment with netml's dependencies installed (`pip install --editable .[cli]`; here the `netml-dev` conda environment). In an unrelated environment they can fail, or crash: e.g. the pandas of a base Python 3.14 installation crashes (segmentation fault) while parsing a pcap.
 
     python -m unittest                                 # all tests (what tox runs)
     python -m tests.bug_fix_tests                      # only the bug-fix tests (about 2 minutes)
@@ -315,6 +321,21 @@ All the data the tests read is in `tests/data/` (155 MB; see [`tests/data/README
 | `demo.pcap`, `demo.csv` | `tests/data/` (Assignment 3; identical to `examples/data/`) | 2, 5 |
 
 The full suite takes about 2–3 minutes (each real capture is parsed once per run). Every test has a time limit (60 s for synthetic tests, 15 minutes for real captures) so that it fails instead of hanging; set `NETML_TEST_TIME_SCALE` (e.g. `3`) on a slow machine.
+
+### Comparing with the original code
+
+`tests/before_bug_fix/src/netml/` is the original library, unchanged (upstream netml 0.7.1, commit `21ba115`; see [`tests/before_bug_fix/README.md`](tests/before_bug_fix/README.md)). One command runs the same tests and measurements against it and against the fixed code, each in its own Python process, and prints the differences:
+
+    python -m tests.bug_fix_tests.compare_before_after                  # everything (about 5 minutes)
+    python -m tests.bug_fix_tests.compare_before_after --synthetic-only # synthetic only (seconds)
+    python -m tests.bug_fix_tests.compare_before_after --report tests/bug_fix_tests/compare_report.md
+
+For each fix it prints:
+
+* **the tests:** how many pass on each version (the tests of a bug fail on the original code; regression guards pass on both);
+* **cases:** a small input that triggers the bug, the output of each version, and *why the original output is wrong*. Cases on synthetic pcaps show the bug in isolation; cases on the real captures in `tests/data/` are the before/after measurements (packet bytes lost, flows and packets dropped, IPv6 flows merged, packets labeled `None`, AUC). Control cases (e.g. `http.pcap`, recorded without a snaplen limit) must give the same output on both versions.
+
+It ends with a summary, and flags any unexpected result (a case that should change but did not, a control that changed, or a test failing on the fixed code), with exit status 1 in that case. `--report FILE` also writes the comparison as Markdown; [`tests/bug_fix_tests/compare_report.md`](tests/bug_fix_tests/compare_report.md) is the report of the last run.
 
 Changes to the existing tests (`tests/cli_tests/test_learn.py`):
 
