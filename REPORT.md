@@ -283,7 +283,31 @@ The two add up to exactly 1, the signature of scores pointing the wrong way. A t
 
 ## 4. Reproducing everything
 
-From a clone of the repository, in an environment with NetML's dependencies (`pip install --editable .[cli]`):
+**Tested environment.** All results in this report were produced on **Ubuntu 26.04 (WSL2 on Windows)**, in a **conda** environment (conda 26.7) with **Python 3.11.17** and the package versions NetML requires:
+
+| Package | Version |
+|---|---|
+| scapy | 2.5.0 |
+| numpy | 2.0.2 |
+| pandas | 2.2.3 |
+| pyod | 2.0.7 |
+| scikit-learn | 1.5.2 |
+| netaddr | 1.3.0 |
+| argcmdr, argparse-formatter, PyYAML, terminaltables (CLI) | 0.13.1, 1.4, 6.0.1, 3.1.10 |
+
+To set up the same environment:
+
+```
+git clone https://github.com/fujiayuFrank/netml.git
+cd netml
+conda create -n netml-dev python=3.11
+conda activate netml-dev
+pip install --editable .[cli]
+```
+
+NetML supports Python 3.9–3.12. Use an environment like this one: in an unrelated environment, e.g. a base Python 3.14 installation, pandas 2.2 crashes (segmentation fault) while parsing a pcap; the comparison script detects this and says so.
+
+Then, from the repository root:
 
 ```
 python -m tests.bug_fix_tests.compare_before_after        # the full comparison (~3 minutes)
