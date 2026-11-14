@@ -25,7 +25,8 @@ class MODEL:
             a score we used to evaluate the model
 
         verbose: int (default is 1)
-            a print level is to control what information should be printed according to the given value.
+            a print level is to control what information should be printed according to
+            the given value.
             The higher the value is, the more info is printed.
 
         random_state: int
@@ -53,7 +54,8 @@ class MODEL:
         X_trian: array
 
         y_train: array (default is None)
-            in unsupervised learning setting, there is no requirement of ground truth to fit the model
+            in unsupervised learning setting, there is no requirement of ground truth
+            to fit the model
 
         Returns
         -------
@@ -70,7 +72,8 @@ class MODEL:
         X_trian: array
 
         y_train: array (default is None)
-            in unsupervised learning setting, there is no requirement of ground truth to fit the model
+            in unsupervised learning setting, there is no requirement of ground truth
+            to fit the model
 
         Returns
         -------
@@ -96,7 +99,8 @@ class MODEL:
         """
         y_score = self.model.decision_function(X_test)
         if self.score_metric == 'auc':
-            # For binary  y_true, y_score is supposed to be the score of the class with greater label.
+            # For binary  y_true, y_score is supposed to be the score of the class
+            # with greater label.
             # pos_label = 1, so y_score should be the corresponding score (i.e., novel score)
             fpr, tpr, _ = roc_curve(y_test, y_score, pos_label=1)
             self.score = metrics.auc(fpr, tpr)

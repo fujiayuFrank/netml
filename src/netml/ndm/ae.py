@@ -107,7 +107,8 @@ class AE(BaseDetector):
             The number of neurons of the latent layer.
 
         verbose: int (default is 1)
-            A print level is to control what information should be printed according to the given value.
+            A print level is to control what information should be printed according to
+            the given value.
             The higher the value is, the more info is printed.
 
         random_state: int (default is 42)
@@ -152,10 +153,13 @@ class AE(BaseDetector):
         train_size = self.n_samples - val_size
         if self.verbose > 5:
             print(f'train_size: {train_size}, val_size: {val_size}')
-        train_dataset, val_dataset = torch.utils.data.random_split(list(zip(X_train, X_train)), [train_size, val_size])
+        train_dataset, val_dataset = torch.utils.data.random_split(list(zip(X_train, X_train)),
+                                                                   [train_size, val_size])
 
         dataloader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-        val_dataloader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=True)
+        # (not used yet: kept for a validation loop; noqa silences flake8's unused-variable check)
+        val_dataloader = DataLoader(val_dataset, batch_size=self.batch_size,  # noqa: F841
+                                    shuffle=True)
 
         # training
         for epoch in range(self.epochs):
@@ -196,7 +200,8 @@ class AE(BaseDetector):
 
         self.model_ = _AutoEncoder(in_dim=self.in_dim, hid_dim=self.hid_dim, lat_dim=self.lat_dim)
 
-        self.optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.lr, weight_decay=self.l2_regularizer)
+        self.optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.lr,
+                                          weight_decay=self.l2_regularizer)
 
         self._fit(X_train, y_train)
 

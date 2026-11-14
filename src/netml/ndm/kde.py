@@ -108,7 +108,8 @@ class KDE(KernelDensity, BaseDetector):
 
     def decision_function(self, X):
         """Predict raw anomaly scores of X using the fitted detector.
-        After invert_order(): the higher score, the more probability of x that is predicted as abnormal
+        After invert_order(): the higher score, the more probability of x that is predicted
+        as abnormal
 
         Parameters
         ----------

@@ -382,8 +382,8 @@ class Learn(Command):
 
         # dynamic argument checks
         if (self.action_extract in actions and not args.pcap
-                                           and not args.pcap_normal
-                                           and not args.pcap_abnormal):
+                and not args.pcap_normal
+                and not args.pcap_abnormal):
             parser.error(f'at least one of the following arguments are required to '
                          f'"{self.action_extract}": -p/--pcap, --pcap-normal or --pcap-abnormal')
 

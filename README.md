@@ -267,6 +267,12 @@ pcap processing (feature extraction)
 common functions (such as `load_data` and `dump_data`)
 - `tests/`\
 test cases
+  - `tests/cli_tests/`\
+  tests of the command-line interface
+  - `tests/bug_fix_tests/`\
+  tests of the five bug fixes (see [Bug fixes](#bug-fixes-november-2026))
+  - `tests/data/`\
+  all the data the tests read (course captures and netml's example pcaps)
 - `LICENSE.txt`
 - `manage.py`\
 library development & management module
@@ -274,6 +280,76 @@ library development & management module
 - `setup.cfg`
 - `setup.py`
 - `tox.ini`
+
+
+## Bug fixes (November 2026)
+
+Five bugs are fixed. Each fix is marked in the code with a comment starting `Bug fix (N/5)`, and tested in `tests/bug_fix_tests/test_N_*.py` by synthetic pcaps with exact expected values and by real captures from the course. Every test documents in its docstring what it checks, the expected result, and the result before the fix.
+
+| # | Bug | Fix | Affected |
+|---|---|---|---|
+| 1 | **Packet sizes were the captured length.** `len(pkt)` is the number of bytes saved in the pcap. With a small snaplen (e.g. 200 bytes), every larger packet was measured as 200 bytes. | The length on the wire, `pkt.wirelen`, which the pcap record stores and Wireshark reports (`_get_pkt_len()`). | `SIZE`, `IAT_SIZE`, `STATS` and `SAMP_SIZE` features; the `length` column of `pcap2pandas()` |
+| 2 | **Splitting a flow dropped its final subflow.** `_pcap2flows()` (timeout split) and `_flows2subflows()` (interval split) kept the packets after the last split only if the flow was not split at all. TCP and UDP were also told apart with `6 in fid`, which is true for a UDP flow on port 6. | The final subflow is always kept (and discarded only if it has too few packets, like any subflow); the protocol is read from the flow id (`fid[4]`). | `pcap2flows()` and everything built on its flows |
+| 3 | **IPv6 was not handled.** scapy's `IP` class matches IPv4 only: all IPv6 connections got one placeholder flow id `('', '', -1, -1, -1)` and were merged, `pcap2pandas()` left IPv6 addresses empty, and header features crashed (`AttributeError: proto`). | The network layer is IPv4 *or* IPv6 (`_get_ip_layer()`); header features use the IPv6 next header and hop limit. | `_get_fid()`, `pcap2pandas()`, `flow2features(header=True)` |
+| 4 | **`pcap2pandas()` bugs and gaps.** Only TCP/UDP/ICMP got a protocol label (ARP, ICMPv6, EAPOL, IGMP, … were `None`); DNS values were 1-element tuples, and an invalid UTF-8 DNS name crashed the parse; `time` held scapy `EDecimal` objects; `datetime` was cut to whole seconds, in the local time zone; `time_normed` was measured from the first row, not the earliest packet. | Protocols checked explicitly, then named from the IP protocol number or EtherType, then `None` (`_get_protocol()`); DNS values as strings (`_dns_text()`); `time` as float; `datetime` exact, in UTC; `time_normed` from the earliest packet, vectorized. | `pcap2pandas()` |
+| 5 | **Isolation Forest ranked anomalies backwards (AUC < 0.5).** pyod's `IForest` already turns scikit-learn's scores round so that outliers score higher; netml's `IF` turned them round again. | pyod's scores are returned as they are. | `IF.decision_function()`, and the AUC `netml learn --algorithm if` reports |
+
+### Running the tests
+
+    python -m unittest                                 # all tests (what tox runs)
+    python -m tests.bug_fix_tests                      # only the bug-fix tests (about 2 minutes)
+    python -m tests.bug_fix_tests --synthetic-only     # only the synthetic tests (a few seconds)
+    python -m tests.bug_fix_tests test_3_ipv6 -v       # one module, one line per test
+
+`--synthetic-only` (or `--quick`) skips every test on a real capture before it parses anything: 35 synthetic tests in about a second, for quick checks while developing. It sets the environment variable `NETML_SYNTHETIC_ONLY`, which also works with `python -m unittest` (e.g. `NETML_SYNTHETIC_ONLY=1 python -m unittest`).
+
+All the data the tests read is in `tests/data/` (155 MB; see [`tests/data/README.md`](tests/data/README.md) for each file's source and purpose), so the tests run as soon as the repository is cloned, and read no data from anywhere else:
+
+| File | Location | Used by fix |
+|---|---|---|
+| `netflix.pcap`, `netflix.csv.gz` | `tests/data/` (Assignment 1, hands-on data) | 1 (recorded with a 200-byte snaplen; the CSV is Wireshark's packet list), 3 (IPv6 traffic) |
+| `http.pcap`, `http.csv.gz` | `tests/data/` (hands-on data) | 1 (control: recorded without a snaplen limit), 4 |
+| `log4j.pcap` | `tests/data/` (hands-on data) | 2 |
+| `nestcam_live.pcap` | `tests/data/` (hands-on data, Assignment 3) | 4 |
+| `google_home.pcap`, `tplink_switch.pcap` | `tests/data/` (Assignment 3) | 4 |
+| `demo.pcap`, `demo.csv` | `tests/data/` (Assignment 3; identical to `examples/data/`) | 2, 5 |
+
+The full suite takes about 2–3 minutes (each real capture is parsed once per run). Every test has a time limit (60 s for synthetic tests, 15 minutes for real captures) so that it fails instead of hanging; set `NETML_TEST_TIME_SCALE` (e.g. `3`) on a slow machine.
+
+Changes to the existing tests (`tests/cli_tests/test_learn.py`):
+
+* The expected numbers of flows were updated: they encoded the dropped subflows of bug 2 (e.g. 88 → 102 labeled flows of `demo.pcap`; 4,979 + 310 → 5,362 + 328 flows of the normal and anomaly pcaps).
+* The two tests that combine `demo.pcap` with the normal and anomaly pcaps are marked as expected failures: they fail because of a known bug that is not fixed here (several pcaps with different feature lengths, see below).
+
+### Code style
+
+`tox -e lint` (flake8 3.8.3) now passes on `src/`: 73 issues were fixed (61 long lines, `from scapy.all import *`, an over-indented continuation line, an unused variable). These changes are style only: the syntax trees of all files are identical before and after, apart from the imports in `parser.py`, where `from scapy.all import *` became `import scapy.all` (kept, because it loads the protocol layers scapy dissects with) plus explicit imports of the names used.
+
+### Design decisions
+
+* **Packet size: `pkt.wirelen`, falling back to `len(pkt)`.** A packet built in memory has no recorded wire length, and then all its bytes are present. Alternative: keep `len(pkt)` and warn about truncated captures; rejected, because the true length is in the pcap.
+* **IPv6 header features: the hop limit stands in for the TTL.** It is the IPv6 field with the same meaning, so features keep the same layout for IPv4 and IPv6. The header features still assume an Ethernet frame (see below).
+* **Protocol labels: explicit list, then the protocol number, then `None`.** TCP, UDP and ICMP are checked first, so every packet labeled before keeps its label (e.g. TCP inside GRE stays `TCP`). The fallback names come from scapy's tables (`/etc/protocols`, `/etc/ethertypes`), so on systems without those files fewer protocols are named.
+* **`datetime` in UTC.** The same pcap gives the same datetimes on every machine. Alternative: keep local time; rejected, because results then depend on where netml runs.
+* **Isolation Forest: return pyod's scores unchanged** rather than invert the scores elsewhere, so `IF` follows pyod's convention (higher score = more anomalous) like the other models; a test checks the scores equal pyod's `IForest`.
+
+### Found but not fixed
+
+These were found while working on the fixes above, and are left for future work:
+
+* Header features assume an Ethernet frame: VLAN-tagged frames give the IP flags instead of the TCP flags, and raw-IP captures crash.
+* `netml learn` with several pcaps crashes when they give different feature lengths, and `classify` crashes on a pcap other than the training one: each pcap gets its own split interval and feature length.
+* `classify` works only with OCSVM: the other models never set the decision threshold that `predict()` needs.
+* The fraction of flows `classify` flags is set inside `--param`, under a different name and default per model (`nu` 0.5 for OCSVM, `contamination` 0.1 for the others).
+* `learn train -f FILE` empties `FILE` before reading it, and a failed run empties existing `-f` / `-o` files.
+* `--param FILE` parses the path itself as YAML text.
+* A pcap without TCP/UDP flows crashes with numpy errors.
+* `examples/capture/capture_pkts.py`: the idle-timeout check is inverted, and the clean-up loop changes the dict it loops over (`RuntimeError`).
+* The examples write into `examples/data/`, and `examples/out/data/OCSVM-results.dat` cannot be loaded.
+* The `ae` model calls `nn.LeakyReLU(True)`: the first argument is the negative slope, so every activation is the identity (slope 1) and the autoencoder is linear (`inplace=True` was probably meant).
+* `interval` is an idle-time threshold, not a window length: a steady long flow is never split.
+* Features are not scaled before modeling.
+* Within a pcap, most feature values are padding and long flows are cut: the feature length is a quantile of the number of packets per flow.
 
 
 ## To Do
@@ -309,6 +385,8 @@ Development tasks are then managed via [`argcmdr`](https://github.com/dssg/argcm
 
 This work was authored by Kun Yang under the direction of Professor Samory
 Kpotufe at Columbia University.
+
+The November 2026 [bug fixes](#bug-fixes-november-2026) were made by Jiayu Fu and Jimmy Li as a course project, with the help of Claude (Anthropic's AI assistant, via Claude Code), to address limitations of the original netml.
 
 
 ## Citation

@@ -5,12 +5,12 @@
 #
 # XXX
 from pyod.models.iforest import IForest
-from pyod.utils import invert_order
 
 
 class IF(IForest):
 
-    def __init__(self, n_estimators=100, max_samples='auto', contamination=0.1, random_state=42, verbose=1):
+    def __init__(self, n_estimators=100, max_samples='auto', contamination=0.1, random_state=42,
+                 verbose=1):
         """Isolation Forest (IF)
 
         Parameters
@@ -22,11 +22,13 @@ class IF(IForest):
             The number of samples to draw from X to train each base estimator.
 
         contamination : float in (0., 0.5), optional (default=0.1)
-            The amount of contamination of the data set, i.e., the proportion of outliers in the data set.
+            The amount of contamination of the data set, i.e., the proportion of
+            outliers in the data set.
             Used when fitting to define the threshold on the decision function.
 
         verbose: int (default is 1)
-            A print level is to control what information should be printed according to the given value.
+            A print level is to control what information should be printed according to
+            the given value.
             The higher the value is, the more info is printed.
 
         random_state: int (default is 42)
@@ -87,8 +89,12 @@ class IF(IForest):
         anomaly_scores : numpy array of shape (n_samples,)
             The anomaly score of the input samples.
         """
-        # invert outlier scores. Outliers comes with higher outlier scores
-        return invert_order(self.model_.decision_function(X))
+        # Bug fix (5/5): pyod's IForest.decision_function() already turns scikit-learn's scores
+        # round, so that outliers get the higher scores (pyod's convention for every model).
+        # They were turned round a second time here with pyod's invert_order(), so normal
+        # samples got the highest anomaly scores and the AUC fell below 0.5. pyod's scores are
+        # now returned as they are.
+        return self.model_.decision_function(X)
 
     def predict_proba(self, X):
         raise NotImplementedError

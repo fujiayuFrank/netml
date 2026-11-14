@@ -56,7 +56,8 @@ class PCA(BaseDetector):
         standardization : bool, optional (default=True)
             If True, perform standardization first to convert
             data to zero mean and unit variance.
-            See http://scikit-learn.org/stable/auto_examples/preprocessing/plot_scaling_importance.html
+            See
+            http://scikit-learn.org/stable/auto_examples/preprocessing/plot_scaling_importance.html
 
         """
         self.n_components = n_components

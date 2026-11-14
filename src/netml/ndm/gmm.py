@@ -52,7 +52,8 @@ class GMM(GaussianMixture, BaseDetector):
             The user-provided initial means, defaults to None,
 
         precisions_init : array-like, optional.
-            The user-provided initial precisions (inverse of the covariance matrices), defaults to None.
+            The user-provided initial precisions (inverse of the covariance matrices),
+            defaults to None.
 
 
         warm_start : bool, default to False.
@@ -128,7 +129,8 @@ class GMM(GaussianMixture, BaseDetector):
         detector. For consistency, outliers are assigned with
         larger anomaly scores. so use invert_order
 
-        After invert_order(): the higher score, the more probability of x that is predicted as abnormal
+        After invert_order(): the higher score, the more probability of x that is predicted
+        as abnormal
 
         Parameters
         ----------
