@@ -14,9 +14,17 @@ from netml.utils.tool import load_data
 
 # TODO: use smaller data files to speed up tests?
 
-DATA_PATH = pathlib.Path(__file__).parent.parent.parent / 'examples' / 'data'
+# the test data (copies of netml's examples/data pcaps; see tests/data/README.md)
+DATA_PATH = pathlib.Path(__file__).parent.parent / 'data'
 
 TEMPDIR_PATH = pathlib.Path(tempfile.gettempdir())
+
+# Number of flows (subflows) that netml extracts from the example pcaps with the default
+# q_interval of 0.9. Bug fix (2/4) changed them: splitting a flow used to drop its final subflow,
+# and these counts used to encode that loss (88, 4,979 and 310 respectively).
+N_DEMO_LABELED = 102     # demo.pcap flows that demo.csv labels
+N_NORMAL = 5362          # srcIP_10.42.0.1_normal.pcap
+N_ANOMALY = 328          # srcIP_10.42.0.119_anomaly.pcap
 
 
 def setUpModule():
@@ -125,7 +133,7 @@ class TestLearnExtractPcapOnly(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 5_289)
+        self.assertEqual(len(features), N_ANOMALY + N_NORMAL)
         self.assertIsNone(labels)
 
 
@@ -145,8 +153,8 @@ class TestLearnExtractPcapLabels(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 88)
-        self.assertEqual(len(labels), 88)
+        self.assertEqual(len(features), N_DEMO_LABELED)
+        self.assertEqual(len(labels), N_DEMO_LABELED)
 
     def test_extract_train(self):
         """extract features & labels and train & test model"""
@@ -185,8 +193,8 @@ class TestLearnExtractPcapLabels(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 176)
-        self.assertEqual(len(labels), 176)
+        self.assertEqual(len(features), 2 * N_DEMO_LABELED)
+        self.assertEqual(len(labels), 2 * N_DEMO_LABELED)
 
     def test_extract_mismatch_length_0(self):
         """cannot specify too many label files for pcap files"""
@@ -247,14 +255,14 @@ class TestLearnExtractPcapNormalAbnormal(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 5289)
-        self.assertEqual(len(labels), 5289)
+        self.assertEqual(len(features), N_NORMAL + N_ANOMALY)
+        self.assertEqual(len(labels), N_NORMAL + N_ANOMALY)
 
         # 0 is normal
-        self.assertFalse(labels[:4979].any())
+        self.assertFalse(labels[:N_NORMAL].any())
 
         # 1 is abnormal
-        self.assertTrue(labels[4979:].all())
+        self.assertTrue(labels[N_NORMAL:].all())
 
     def test_extract_train(self):
         """extract flag-labeled features and train & test model"""
@@ -299,16 +307,16 @@ class TestLearnExtractPcapMixed(CLITestCase):
 
         (features, labels) = load_data(feature_path)
 
-        self.assertEqual(len(features), 88 + 4979 + 310)
-        self.assertEqual(len(labels), 88 + 4979 + 310)
+        self.assertEqual(len(features), N_DEMO_LABELED + N_NORMAL + N_ANOMALY)
+        self.assertEqual(len(labels), N_DEMO_LABELED + N_NORMAL + N_ANOMALY)
 
         # 0 is normal; 1 is abnormal
-        self.assertTrue(labels[:88].any())
-        self.assertFalse(labels[:88].all())
+        self.assertTrue(labels[:N_DEMO_LABELED].any())
+        self.assertFalse(labels[:N_DEMO_LABELED].all())
 
-        self.assertFalse(labels[88:4979].any())
+        self.assertFalse(labels[N_DEMO_LABELED:N_DEMO_LABELED + N_NORMAL].any())
 
-        self.assertTrue(labels[(88 + 4979):].all())
+        self.assertTrue(labels[(N_DEMO_LABELED + N_NORMAL):].all())
 
     def test_extract_train(self):
         """extract file-labeled & flag-labeled features and train & test model"""

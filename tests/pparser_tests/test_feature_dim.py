@@ -6,8 +6,11 @@ import numpy as np
 
 from netml.pparser.parser import PCAP
 
-DATA = pathlib.Path(__file__).parent.parent.parent / 'examples' / 'data' / 'srcIP_10.42.0.1'
-PCAPS = [DATA / 'srcIP_10.42.0.119_anomaly.pcap', DATA / 'srcIP_10.42.0.1_normal.pcap']
+DATA = pathlib.Path(__file__).parent.parent.parent / 'examples' / 'data'
+# Two captures whose default IAT widths differ (51 and 12 at q_interval=0.9). (The anomaly and
+# normal srcIP_10.42.0.1 captures differed only because splitting a flow dropped its final
+# subflow; with that fixed, both give 12.)
+PCAPS = [DATA / 'demo.pcap', DATA / 'srcIP_10.42.0.1' / 'srcIP_10.42.0.1_normal.pcap']
 
 
 def flows(path):
