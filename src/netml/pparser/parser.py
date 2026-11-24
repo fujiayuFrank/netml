@@ -5,46 +5,214 @@
 """
 import ipaddress
 from collections import OrderedDict
-from datetime import datetime
 
 import netaddr
 import numpy as np
 import pandas as pd
 
-#
-# FIXME: 'import *' bad for a number of reasons...
-#
-# For one: the below imports class 'datetime.datetime' and invalidates our import of the module.
-#
-# (So for now we'll import the class datetime.datetime as well.)
-#
-from scapy.all import *
+# scapy.all is imported for its side effect: it loads all of scapy's default protocol layers,
+# which decides how packets are dissected (e.g. which encapsulations are decoded). The names used
+# here are imported explicitly below, instead of with "from scapy.all import *", which hid where
+# names came from (and shadowed the datetime module with the datetime class).
+import scapy.all  # noqa: F401
+from scapy.layers.dns import DNSQR, DNSRR
+from scapy.utils import PcapReader
 
-from scapy.layers.inet import IP, TCP, UDP
+from scapy.data import ETHER_TYPES, IP_PROTOS
+from scapy.layers.eap import EAPOL
+from scapy.layers.inet import ICMP, IP, TCP, UDP
+from scapy.layers.inet6 import IPv6, _ICMPv6, _IPv6ExtHdr
+from scapy.layers.ipsec import AH, ESP
+from scapy.layers.l2 import ARP, GRE, STP, CookedLinux, Dot1Q, Ether
+from scapy.layers.ppp import PPPoE, PPPoED
+from scapy.layers.sctp import SCTP
+from scapy.layers.vrrp import VRRP, VRRPv3
 
 from netml.utils.tool import data_info, timing
 
 
-def _get_fid(pkt):
-    """Extract fid (five-tuple) from a packet: only focus on IPv4
+def _get_pkt_len(pkt):
+    """Get the length of a packet on the wire, in bytes.
+
+    Bug fix (1/4): packet sizes were measured with ``len(pkt)``, the number of bytes *saved in
+    the pcap*. A capture recorded with a small snaplen saves only the first bytes of each packet
+    (e.g. 200), so every larger packet was measured as 200 bytes. Each pcap record also stores
+    the packet's original length, which scapy exposes as ``pkt.wirelen``; it is the length
+    Wireshark reports. When the whole packet was saved, the two are equal.
+
     Parameters
     ----------
+    pkt:
+        a packet
 
     Returns
     -------
-        fid: five-tuple
+        pkt_len: int
     """
+    if pkt.wirelen is None:
+        # a packet built in memory (not read from a pcap) has no recorded wire length: all of
+        # its bytes are there, so its own length is its length on the wire
+        return len(pkt)
+    return pkt.wirelen
 
-    if IP in pkt and TCP in pkt:
+
+def _get_ip_layer(pkt):
+    """Get the IPv4 or the IPv6 layer of a packet, or None if it has neither.
+
+    Bug fix (3/4): scapy's ``IP`` class matches IPv4 only, so ``IP in pkt`` / ``pkt[IP]`` missed
+    every IPv6 packet. IPv4 and IPv6 layers both have ``src`` and ``dst`` address fields.
+    """
+    ip = pkt.getlayer(IP)
+    if ip is None:
+        ip = pkt.getlayer(IPv6)
+    return ip
+
+
+def _get_fid(pkt):
+    """Extract fid (five-tuple) from an IPv4 or IPv6 packet
+
+    Parameters
+    ----------
+    pkt:
+        a packet
+
+    Returns
+    -------
+        fid: five-tuple (source address, destination address, source port, destination port,
+        protocol number), or ('', '', -1, -1, -1) if the packet is not IPv4/IPv6 TCP or UDP
+    """
+    # Bug fix (3/4): the network layer was looked up with "IP in pkt" (IPv4 only), so every
+    # IPv6 TCP/UDP packet got the placeholder id below, and all IPv6 connections of a pcap were
+    # merged into one fake flow.
+    ip = _get_ip_layer(pkt)
+
+    if ip is not None and TCP in pkt:
         # flow_type = 'TCP'
-        fid = (pkt[IP].src, pkt[IP].dst, pkt[TCP].sport, pkt[TCP].dport, 6)
-    elif IP in pkt and UDP in pkt:
+        fid = (ip.src, ip.dst, pkt[TCP].sport, pkt[TCP].dport, 6)
+    elif ip is not None and UDP in pkt:
         # flow_type = 'UDP'
-        fid = (pkt[IP].src, pkt[IP].dst, pkt[UDP].sport, pkt[UDP].dport, 17)
+        fid = (ip.src, ip.dst, pkt[UDP].sport, pkt[UDP].dport, 17)
     else:  # others
         fid = ('', '', -1, -1, -1)
 
     return fid
+
+
+def _has_icmpv6(pkt):
+    """True if the packet has an ICMPv6 layer.
+
+    scapy has one class per ICMPv6 message type (ICMPv6EchoRequest, ICMPv6ND_NS, ...), all
+    subclasses of _ICMPv6, and ``X in pkt`` matches only the exact class X, so the check is made
+    against the base class.
+    """
+    return any(issubclass(layer, _ICMPv6) for layer in pkt.layers())
+
+
+def _get_ip_proto_number(pkt):
+    """Get the IP protocol number (IPv4 "proto", IPv6 "nh"), or None if the packet is not IP.
+
+    For IPv6, extension headers (hop-by-hop, routing, fragment, ...) are skipped: each names the
+    next header in its own "nh" field, and the last one names the protocol carried.
+    """
+    if IP in pkt:
+        return pkt[IP].proto
+    if IPv6 not in pkt:
+        return None
+
+    ipv6 = pkt[IPv6]
+    proto = ipv6.nh
+    layer = ipv6.payload
+    while isinstance(layer, _IPv6ExtHdr):
+        proto = layer.nh
+        layer = layer.payload
+    return proto
+
+
+def _get_ethertype(pkt):
+    """Get the EtherType (the protocol carried by the link layer), or None.
+
+    For a VLAN-tagged frame, the EtherType inside the (first) VLAN tag is used.
+    """
+    if Dot1Q in pkt:
+        return pkt[Dot1Q].type
+    if Ether in pkt:
+        return pkt[Ether].type
+    if CookedLinux in pkt:  # Linux "any"-interface captures
+        return pkt[CookedLinux].proto
+    return None
+
+
+def _lookup_protocol_name(table, number):
+    """Look up a protocol number in one of scapy's name tables (loaded from /etc/protocols and
+    /etc/ethertypes). Returns the upper-cased name, or None if the number is not in the table."""
+    if number is None or number not in table:
+        return None
+    return table[number].upper()
+
+
+def _get_protocol(pkt):
+    """Get the protocol name of a packet, for the "protocol" column of pcap2pandas().
+
+    Bug fix (4/4): only TCP, UDP and ICMP were labeled; every other packet (ARP, ICMPv6, IGMP,
+    EAPOL, ...) was labeled None. The label is now chosen in three steps:
+
+    1. Protocols checked explicitly, in this order (the first match wins). TCP, UDP and ICMP
+       come first, so the packets labeled before keep their label (e.g. TCP tunneled over GRE
+       is still 'TCP').
+    2. Otherwise, the name of the protocol number in the packet's own headers: the IP protocol
+       number for IP packets (e.g. 2 -> 'IGMP'), else the EtherType (e.g. 0x88cc -> 'LLDP').
+       This also names protocols that scapy cannot dissect.
+    3. Otherwise, None.
+    """
+    if TCP in pkt:
+        return 'TCP'
+    if UDP in pkt:
+        return 'UDP'
+    if ICMP in pkt:
+        return 'ICMP'
+    if _has_icmpv6(pkt):
+        return 'ICMPv6'
+    if SCTP in pkt:
+        return 'SCTP'
+    if GRE in pkt:
+        return 'GRE'
+    if ESP in pkt:
+        return 'ESP'
+    if AH in pkt:
+        return 'AH'
+    if (VRRP in pkt) or (VRRPv3 in pkt):
+        return 'VRRP'
+    if ARP in pkt:
+        return 'ARP'
+    if EAPOL in pkt:
+        return 'EAPOL'
+    if STP in pkt:
+        return 'STP'
+    if (PPPoED in pkt) or (PPPoE in pkt):
+        return 'PPPoE'
+
+    ip_proto = _get_ip_proto_number(pkt)
+    if ip_proto is not None:
+        # an IP packet: its IP protocol number names it (its EtherType would only say IPv4/IPv6)
+        return _lookup_protocol_name(IP_PROTOS, ip_proto)
+    return _lookup_protocol_name(ETHER_TYPES, _get_ethertype(pkt))
+
+
+def _dns_text(value):
+    """Turn a DNS name or record value from scapy into a string (None stays None).
+
+    Bug fix (4/4): DNS values were stored as 1-element tuples, e.g. ('example.com.',), and a
+    name that is not valid UTF-8 raised UnicodeDecodeError, which aborted the whole parse.
+    scapy gives names as bytes, A/AAAA records as str and TXT records as a list of bytes. Bytes
+    that are not valid UTF-8 (malformed or malicious packets) are replaced with U+FFFD.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    if isinstance(value, (list, tuple)):
+        return ' '.join(_dns_text(v) for v in value)
+    return str(value)
 
 
 def _get_frame_time(pkt):
@@ -156,41 +324,35 @@ def _pcap2flows(pcap_file, flow_pkts_thres=2, *, tcp_timeout=600, udp_timeout=60
             pkt_time = _get_frame_time(pkt)
             if j == 0:
                 subflow_tmp = [pkt]
-                split_flow = False  # if a flow is not split with interval, label it as False, otherwise, True
                 continue
-            # print(fid, pkt)
-            if (6 in fid) or (TCP in pkt):
+            # Bug fix (2/4): the protocol is the last item of the fid. The test was
+            # "(6 in fid) or (TCP in pkt)", which is also true for a UDP flow from or to port 6,
+            # so such a flow was split with the TCP timeout instead of the UDP one.
+            if fid[4] == 6:
                 # handle TCP packets, TCP is 6
                 # a timeout (the idle time) is the duration between the previous pkt and the current one.
                 if pkt_time - _get_frame_time(subflow_tmp[-1]) > tcp_timeout:
-                    # Note: here subflow_tmp will only have 1 packet
                     subflows.append((fid, subflow_tmp))
                     subflow_tmp = [pkt]  # create a new subflow and store the current packet as the first packet of it.
-                    split_flow = True
                 else:
                     subflow_tmp.append(pkt)
-            elif (17 in fid) or UDP in pkt:
+            elif fid[4] == 17:
                 # handle UDP packets, UDP is 17
                 if pkt_time - _get_frame_time(subflow_tmp[-1]) > udp_timeout:
-                    # print(fid, len(subflow_tmp))
-                    # Note: here subflow_tmp will only have 1 packet
-                    # E.g., without timeout splitting, the flow has two packets, pkt1 (time=2020-08-06 11:01:20.029699)
-                    # and pkt2 (time=2020-08-07 01:01:20.376141), so after timeout splitting, subflow_tmp = [pkt1]
-                    # (only one packet)
                     subflows.append((fid, subflow_tmp))
                     subflow_tmp = [pkt]
-                    split_flow = True
                 else:
                     subflow_tmp.append(pkt)
             else:  # it's not possible, because flows only include TCP and UDP flows
                 pass
 
-        # if the current flow is not split by TIMEOUT, then add it into subflows
-        if not split_flow:
-            subflows.append((fid, subflow_tmp))
-        else:
-            # discard the last subflow_tmp
-            pass
+        # Bug fix (2/4): a subflow is appended above only when the *next* subflow starts, so the
+        # last one is still in subflow_tmp. It was appended only if the flow had not been split
+        # at all ("discard the last subflow_tmp" otherwise), which silently dropped every packet
+        # after the last split of every split flow. It is now always appended: the last subflow
+        # is the whole flow if it was not split. Subflows with fewer than flow_pkts_thres
+        # packets are discarded just below, the last one included.
+        subflows.append((fid, subflow_tmp))
 
         new_flows.extend(subflows)
 
@@ -247,10 +409,12 @@ def _flows2subflows(flows, interval=10, *, flow_pkts_thres=2, verbose=0):
             if j == 0:
                 subflow_tmp_start_time = pkt_time
                 subflow_tmp = [(subflow_tmp_start_time, pkt)]
-                split_flow = False  # if a flow is not split with interval, label it as False, otherwise, True
                 continue
 
-            if (6 in fid) or (TCP in pkt):
+            # Bug fix (2/4): the protocol is the last item of the fid ("6 in fid" also matched a
+            # port number 6). (Both branches use the same interval here, so this only keeps the
+            # two splitting functions consistent.)
+            if fid[4] == 6:
                 # handle TCP packets, TCP is 6
                 # a timeout (the idle time) is the duration between the previous pkt and the current one.
                 if pkt_time - subflow_tmp[-1][0] > interval:
@@ -259,28 +423,24 @@ def _flows2subflows(flows, interval=10, *, flow_pkts_thres=2, verbose=0):
                     # create a new subflow and store "subflow_tmp_start_time" as the time. Here, it will has a tiny
                     # difference of packet time between "subflow_tmp_start_time" and the current packet time.
                     subflow_tmp = [(subflow_tmp_start_time, pkt)]
-                    split_flow = True
                 else:
                     subflow_tmp.append((pkt_time, pkt))
 
-            elif (17 in fid) or UDP in pkt:
+            elif fid[4] == 17:
                 # handle UDP packets, UDP is 17
                 if pkt_time - subflow_tmp[-1][0] > interval:
                     subflows.append((fid, subflow_tmp))
                     subflow_tmp_start_time += int((pkt_time - subflow_tmp_start_time) // interval) * interval
                     subflow_tmp = [(subflow_tmp_start_time, pkt)]
-                    split_flow = True
                 else:
                     subflow_tmp.append((pkt_time, pkt))
             else:  # it's not possible, because flows only include TCP and UDP flows
                 pass
 
-        # if the current flow is not split by interval, then add it into subflows
-        if not split_flow:
-            subflows.append([fid, subflow_tmp])
-        else:
-            # discard the last subflow_tmp
-            pass
+        # Bug fix (2/4): as in _pcap2flows(), the last subflow was appended only if the flow had
+        # not been split, so the packets after the last split were dropped. It is now always
+        # appended; subflows that are too short are discarded below, the last one included.
+        subflows.append((fid, subflow_tmp))
 
         new_flows.extend(subflows)
 
@@ -342,9 +502,22 @@ def _get_header_features(flows):
         flgs_lst = np.zeros((8, 1))  # 8 TCP flags
         header_features = []
         for i, pkt in enumerate(pkts):
-            if pkt.payload.proto == 6:  # tcp
-                flgs_lst += np.asarray(_parse_tcp_flgs(pkt.payload.payload.flags)).reshape(-1, 1)  # parses tcp.flgs
-            header_features.append(pkt.payload.ttl)
+            # pkt.payload is the network layer of an Ethernet frame (the layout assumed here).
+            network = pkt.payload
+            if isinstance(network, IPv6):
+                # Bug fix (3/4): the IPv4 fields "proto" and "ttl" do not exist in IPv6, so IPv6
+                # packets raised AttributeError. IPv6 names the carried protocol in "nh" (after
+                # any extension headers, so TCP is looked up as a layer), and its hop limit
+                # ("hlim") is the IPv6 equivalent of the IPv4 TTL.
+                tcp = network.getlayer(TCP)
+                if tcp is not None:
+                    flgs_lst += np.asarray(_parse_tcp_flgs(tcp.flags)).reshape(-1, 1)
+                header_features.append(network.hlim)
+                continue
+            if network.proto == 6:  # tcp
+                # parses tcp.flgs
+                flgs_lst += np.asarray(_parse_tcp_flgs(network.payload.flags)).reshape(-1, 1)
+            header_features.append(network.ttl)
 
         features.append(list(flgs_lst.flatten()) + header_features)
 
@@ -391,7 +564,8 @@ def _get_SIZE(flows):
     features = []
     fids = []
     for fid, pkts in flows:
-        sizes = [len(pkt) for pkt in pkts]
+        # Bug fix (1/4): the length on the wire, not the captured length (see _get_pkt_len)
+        sizes = [_get_pkt_len(pkt) for pkt in pkts]
         features.append(sizes)
         fids.append(fid)
 
@@ -416,7 +590,8 @@ def _get_IAT_SIZE(flows):
     for fid, pkts in flows:
         pkt_times = [_get_frame_time(pkt) for pkt in pkts]
         iats = list(np.diff(pkt_times))
-        sizes = [len(pkt) for pkt in pkts]
+        # Bug fix (1/4): the length on the wire, not the captured length (see _get_pkt_len)
+        sizes = [_get_pkt_len(pkt) for pkt in pkts]
         iats_sizes = []
         for j in range(len(iats)):
             iats_sizes.extend([iats[j], sizes[j]])
@@ -446,11 +621,12 @@ def _get_STATS(flows):
     features = []
     fids = []
     for fid, pkts in flows:
-        sizes = [len(pkt) for pkt in pkts]
+        # Bug fix (1/4): the length on the wire, not the captured length (see _get_pkt_len)
+        sizes = [_get_pkt_len(pkt) for pkt in pkts]
 
         sub_duration = _get_flow_duration(pkts)
         num_pkts = len(sizes)  # number of packets in the flow
-        num_bytes = sum(sizes)  # all bytes in sub_duration  sum(len(pkt))
+        num_bytes = sum(sizes)  # all bytes in sub_duration
         if sub_duration == 0:
             pkts_rate = 0.0
             bytes_rate = 0.0
@@ -507,7 +683,8 @@ def _get_SAMP(flows, sampling_feature='SAMP_NUM', sampling_rate=0.1, verbose=0):
         # for each flow
         each_flow_features = []
         pkt_times = [_get_frame_time(pkt) for pkt in pkts]
-        pkt_sizes = [len(pkt) for pkt in pkts]
+        # Bug fix (1/4): the length on the wire, not the captured length (see _get_pkt_len)
+        pkt_sizes = [_get_pkt_len(pkt) for pkt in pkts]
         samp_sub = -1
         for i in range(len(pkts)):
             if i == 0:
@@ -1010,19 +1187,21 @@ class PCAP:
 
             The dicts have the following key/value pairs:
 
-              "time"      : time the packet was receieved in seconds since epoch
-              "datetime"  : time the packet was received as a datetime object
-              "length"    : length of packet in bytes
+              "time"      : time the packet was received in seconds since epoch (float)
+              "datetime"  : time the packet was received, in nanoseconds since epoch (int;
+                            turned into a UTC datetime by _pcap2pandas)
+              "length"    : length of packet on the wire in bytes
               "mac_src"   : source MAC address
               "mac_dst"   : destination MAC address
               "ip_src"    : source IP address
               "ip_dst"    : destination IP address
-              "protocol"  : 'TCP', 'UDP', 'ICMP', or None
+              "protocol"  : protocol name, e.g. 'TCP', 'ARP', 'ICMPv6', or None
+                            (see _get_protocol)
               "port_src"  : source port
               "port_dst"  : destination port
               "is_dns"    : True if packet is DNS packet, else False
-              "dns_query" : string DNS query
-              "dns_resp"  : string DNS response
+              "dns_query" : DNS query name (str)
+              "dns_resp"  : DNS answer of the (first) answer record (str)
 
         """
         with PcapReader(self.pcap_file) as pcap_reader:
@@ -1030,9 +1209,17 @@ class PCAP:
                 pkt_dict = dict.fromkeys(self._pcap_columns)
 
                 pkt_dict.update(
-                    time=pkt.time,
-                    datetime=datetime.fromtimestamp(int(pkt.time)),
-                    length=len(pkt),
+                    # Bug fix (4/4): a float. pkt.time is a scapy EDecimal, which made "time"
+                    # an object column of EDecimal values.
+                    time=float(pkt.time),
+                    # Bug fix (4/4): datetime.fromtimestamp(int(pkt.time)) cut the time to whole
+                    # seconds and converted it to the local time zone of the machine running
+                    # netml. pkt.time is an exact decimal number of seconds (as stored in the
+                    # pcap), so it is kept here as integer nanoseconds and turned into a UTC
+                    # datetime by _pcap2pandas().
+                    datetime=int(pkt.time * 1_000_000_000),
+                    # Bug fix (1/4): the length on the wire, not the captured length
+                    length=_get_pkt_len(pkt),
                     is_dns=False,
                 )
 
@@ -1040,44 +1227,35 @@ class PCAP:
                     pkt_dict['mac_dst'] = pkt[Ether].dst
                     pkt_dict['mac_src'] = pkt[Ether].src
 
-                if IP in pkt:
-                    pkt_dict['ip_dst'] = pkt[IP].dst
-                    pkt_dict['ip_src'] = pkt[IP].src
+                # Bug fix (3/4): IPv4 or IPv6; "IP in pkt" left IPv6 addresses empty
+                ip = _get_ip_layer(pkt)
+                if ip is not None:
+                    pkt_dict['ip_dst'] = ip.dst
+                    pkt_dict['ip_src'] = ip.src
 
                 if TCP in pkt:
                     pkt_dict['port_dst'] = pkt[TCP].dport
                     pkt_dict['port_src'] = pkt[TCP].sport
-                    pkt_dict['protocol'] = 'TCP'
                 elif UDP in pkt:
                     pkt_dict['port_dst'] = pkt[UDP].dport
                     pkt_dict['port_src'] = pkt[UDP].sport
-                    pkt_dict['protocol'] = 'UDP'
-                elif ICMP in pkt:
-                    pkt_dict['protocol'] = 'ICMP'
 
+                # Bug fix (4/4): every protocol that can be named, not only TCP/UDP/ICMP
+                pkt_dict['protocol'] = _get_protocol(pkt)
+
+                # Bug fix (4/4): DNS values as strings (they were 1-element tuples), and names
+                # that are not valid UTF-8 no longer abort the parse (see _dns_text)
                 if (dnsqr := pkt.getlayer(DNSQR)) is not None:
                     pkt_dict.update(
                         is_dns=True,
-                        dns_query=(
-                            dnsqr.qname.decode('utf-8')
-                            if isinstance(dnsqr.qname, bytes)
-                            else dnsqr.qname,
-                        )
+                        dns_query=_dns_text(dnsqr.qname),
                     )
 
                 if (dnsrr := pkt.getlayer(DNSRR)) is not None:
                     pkt_dict.update(
                         is_dns=True,
-                        dns_query=(
-                            dnsrr.rrname.decode('utf-8')
-                            if isinstance(dnsrr.rrname, bytes)
-                            else dnsrr.rrname,
-                        ),
-                        dns_resp=(
-                            dnsrr.rdata.decode('utf-8')
-                            if isinstance(dnsrr.rdata, bytes)
-                            else dnsrr.rdata,
-                        )
+                        dns_query=_dns_text(dnsrr.rrname),
+                        dns_resp=_dns_text(dnsrr.rdata),
                     )
 
                 yield pkt_dict
@@ -1097,7 +1275,13 @@ class PCAP:
         """
         self.df = pd.DataFrame(self._iter_pcap_dict(), columns=self._pcap_columns)
 
-        self.df['datetime'] = pd.to_datetime(self.df['datetime'])
+        # Bug fix (4/4): floats, also for an empty pcap (an empty column would be "object")
+        self.df['time'] = self.df['time'].astype(float)
+
+        # Bug fix (4/4): full precision, in UTC, so the same pcap gives the same datetimes on
+        # every machine, whatever its local time zone (see _iter_pcap_dict)
+        self.df['datetime'] = pd.to_datetime(self.df['datetime'].astype('int64'), unit='ns',
+                                             utc=True)
 
         self.df['ip_dst_int'] = self.df['ip_dst'].apply(
             lambda x: None if _missing(x) else int(ipaddress.ip_address(x)))
@@ -1111,7 +1295,12 @@ class PCAP:
         self.df['mac_src_int'] = self.df['mac_src'].apply(
             lambda x: None if _missing(x) else int(netaddr.EUI(x)))
 
-        self.df['time_normed'] = self.df['time'].apply(lambda x: x - self.df.iloc[0]['time'])
+        # Bug fix (4/4): seconds since the *earliest* packet. It was measured from the first row,
+        # which is not the earliest packet when packets are stored out of time order (giving
+        # negative values), with one DataFrame lookup per row. It is now computed in one
+        # vectorized step, from the exact datetimes.
+        time_since_start = self.df['datetime'] - self.df['datetime'].min()
+        self.df['time_normed'] = time_since_start.dt.total_seconds()
 
         self.df.sort_index(axis=1, inplace=True)
 
