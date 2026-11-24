@@ -8,11 +8,12 @@ One module per fix:
     test_3_ipv6               IPv6 flow ids, addresses and header features
     test_4_pcap2pandas        pcap2pandas protocol labels and DNS/time columns
     test_5_isolation_forest   Isolation Forest ranks anomalies above normal flows (fixed upstream,
-                              noise-lab/netml#40: passes on upstream master too)
+                              noise-lab/netml#40): a regression check, skipped by default
 
 Each module has synthetic tests (small pcaps built in the test, with exact expected values) and
 tests on real captures from the course, which are shipped in tests/data (see tests/data/README.md).
 
 Run them with `python -m tests.bug_fix_tests` (see __main__.py); add --synthetic-only to run only
-the synthetic tests, in a few seconds.
+the synthetic tests, in a few seconds, or --isolation-forest to run only the Isolation Forest
+regression check.
 """

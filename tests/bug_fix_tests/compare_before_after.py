@@ -17,10 +17,15 @@ and prints, for each fix:
 Usage, from the repository root, in the netml development environment (conda activate netml-dev;
 the workers use the same Python as this script):
 
-    python -m tests.bug_fix_tests.compare_before_after                   everything (~5 minutes)
+    python -m tests.bug_fix_tests.compare_before_after                   fixes 1-4 (~3 minutes)
     python -m tests.bug_fix_tests.compare_before_after --synthetic-only  synthetic only (seconds)
-    python -m tests.bug_fix_tests.compare_before_after --report FILE     also a Markdown report
+    python -m tests.bug_fix_tests.compare_before_after --output FILE     also write it as Markdown
     python -m tests.bug_fix_tests.compare_before_after --fix 1 3         only some fixes
+    python -m tests.bug_fix_tests.compare_before_after --fix 5           the Isolation Forest check
+
+Fix 5 (Isolation Forest) was fixed upstream (noise-lab/netml#40), so it is left out by default;
+with --fix 5 its tests and case run as a regression check, and must give the same result on both
+versions.
 
 The exit status is 1 if a case behaves unexpectedly (an output that should change did not, or one
 that should not change did) or if a bug-fix test fails on the fixed code, and 0 otherwise.
@@ -86,6 +91,9 @@ FIXES = {
         'noise-lab/netml#40, so it is already fixed in "before": its test and case are a check '
         'that the fix holds, and must give the same result on both versions.'),
 }
+
+# fixes compared by default: 5 was fixed upstream, and is compared only with --fix 5
+DEFAULT_FIXES = [1, 2, 3, 4]
 
 # The cases, in the order they are printed. "change": whether the fix should change the output
 # (False for controls, which must give the same output on both versions).
@@ -661,7 +669,7 @@ def _wrap(text, indent, width=99):
     return textwrap.fill(text, width=width, initial_indent=indent, subsequent_indent=indent)
 
 
-def compare(fixes, synthetic_only, report_path):
+def compare(fixes, synthetic_only, output_path):
     lines = []      # the Markdown report
     problems = []   # unexpected results
 
@@ -802,9 +810,9 @@ def compare(fixes, synthetic_only, report_path):
         say('\nNo unexpected results.')
     say(f'\n(took {time.time() - started:.0f} s)')
 
-    if report_path:
-        pathlib.Path(report_path).write_text('\n'.join(lines) + '\n')
-        print(f'report written to {pathlib.Path(report_path).resolve()}')
+    if output_path:
+        pathlib.Path(output_path).write_text('\n'.join(lines) + '\n')
+        print(f'results written to {pathlib.Path(output_path).resolve()}')
     return 1 if problems else 0
 
 
@@ -838,14 +846,22 @@ def main(argv=None):
     arg_parser.add_argument('--synthetic-only', '--quick', action='store_true',
                             help='only the synthetic tests and cases (a few seconds)')
     arg_parser.add_argument('--fix', type=int, nargs='+', choices=sorted(FIXES),
-                            default=sorted(FIXES), metavar='N',
-                            help='only these fixes (1-4, or 5 for the upstream fix; default: all)')
-    arg_parser.add_argument('--report', metavar='FILE', help='also write a Markdown report')
+                            default=DEFAULT_FIXES, metavar='N',
+                            help='only these fixes (default: 1-4; 5 is the Isolation Forest '
+                                 'regression check, fixed upstream)')
+    arg_parser.add_argument('-o', '--output', metavar='FILE',
+                            help='also write the results as Markdown, e.g. '
+                                 'tests/bug_fix_tests/compare_result.md')
+    # the earlier name of --output, kept so that older instructions still work
+    arg_parser.add_argument('--report', dest='output', metavar='FILE', help=argparse.SUPPRESS)
     args = arg_parser.parse_args(argv)
     _check_environment()
     if not (VERSIONS['before'] / 'netml').is_dir():
         raise SystemExit(f'{VERSIONS["before"]} is missing (see tests/before_bug_fix/README.md)')
-    return compare(sorted(set(args.fix)), args.synthetic_only, args.report)
+    if 5 in args.fix:
+        # the workers inherit this: the Isolation Forest tests are skipped unless it is set
+        os.environ[_helpers.ISOLATION_FOREST_VARIABLE] = '1'
+    return compare(sorted(set(args.fix)), args.synthetic_only, args.output)
 
 
 if __name__ == '__main__':

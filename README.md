@@ -320,7 +320,7 @@ library development & management module
 
 Four bugs are fixed, on top of upstream netml master (noise-lab/netml, commit `ef55aef`). Each fix is marked in the code with a comment starting `Bug fix (N/4)`, and tested in `tests/bug_fix_tests/test_N_*.py` by synthetic pcaps with exact expected values and by real captures from the course. Every test documents in its docstring what it checks, the expected result, and the result before the fix.
 
-A fifth bug found in this project, the inverted Isolation Forest scores, has since been fixed upstream (noise-lab/netml#40). Its test, `tests/bug_fix_tests/test_5_isolation_forest.py`, is kept as a regression test: it passes against upstream master, and fails on netml 0.7.1.
+A fifth bug found in this project, the inverted Isolation Forest scores, has since been fixed upstream (noise-lab/netml#40). Its test, `tests/bug_fix_tests/test_5_isolation_forest.py`, is kept as a regression check, which is **skipped by default** and run with its own command (`python -m tests.bug_fix_tests --isolation-forest`, below): it passes against upstream master, and fails on netml 0.7.1.
 
 | # | Bug | Fix | Affected |
 |---|---|---|---|
@@ -335,11 +335,14 @@ A fifth bug found in this project, the inverted Isolation Forest scores, has sin
 Run the tests in an environment with netml's dependencies installed (`pip install --editable .[cli]`; here the `netml-dev` conda environment). In an unrelated environment they can fail, or crash: e.g. the pandas of a base Python 3.14 installation crashes (segmentation fault) while parsing a pcap.
 
     python -m unittest                                 # all tests (what tox runs)
-    python -m tests.bug_fix_tests                      # only the bug-fix tests (about 2 minutes)
+    python -m tests.bug_fix_tests                      # only the tests of fixes 1-4 (about 2 minutes)
     python -m tests.bug_fix_tests --synthetic-only     # only the synthetic tests (a few seconds)
     python -m tests.bug_fix_tests test_3_ipv6 -v       # one module, one line per test
+    python -m tests.bug_fix_tests --isolation-forest   # only the Isolation Forest regression check
 
-`--synthetic-only` (or `--quick`) skips every test on a real capture before it parses anything: 35 synthetic tests in about a second, for quick checks while developing. It sets the environment variable `NETML_SYNTHETIC_ONLY`, which also works with `python -m unittest` (e.g. `NETML_SYNTHETIC_ONLY=1 python -m unittest`).
+The Isolation Forest tests are skipped by default, by every command above except the last: that bug was fixed upstream (noise-lab/netml#40), so they only guard against it coming back. `--isolation-forest` runs just those 3 tests (a few seconds); it sets the environment variable `NETML_CHECK_ISOLATION_FOREST`, which also works with `python -m unittest`.
+
+`--synthetic-only` (or `--quick`) skips every test on a real capture before it parses anything: the synthetic tests run in about a second, for quick checks while developing. It sets the environment variable `NETML_SYNTHETIC_ONLY`, which also works with `python -m unittest` (e.g. `NETML_SYNTHETIC_ONLY=1 python -m unittest`).
 
 All the data the tests read is in `tests/data/` (155 MB; see [`tests/data/README.md`](tests/data/README.md) for each file's source and purpose), so the tests run as soon as the repository is cloned, and read no data from anywhere else:
 
@@ -358,16 +361,19 @@ The full suite takes about 2–3 minutes (each real capture is parsed once per r
 
 `tests/before_bug_fix/src/netml/` is the original library, unchanged (upstream netml master, commit `ef55aef`, which already includes the Isolation Forest fix; see [`tests/before_bug_fix/README.md`](tests/before_bug_fix/README.md)). One command runs the same tests and measurements against it and against the fixed code, each in its own Python process, and prints the differences:
 
-    python -m tests.bug_fix_tests.compare_before_after                  # everything (about 5 minutes)
+    python -m tests.bug_fix_tests.compare_before_after                  # fixes 1-4 (about 3 minutes)
     python -m tests.bug_fix_tests.compare_before_after --synthetic-only # synthetic only (seconds)
-    python -m tests.bug_fix_tests.compare_before_after --report tests/bug_fix_tests/compare_report.md
+    python -m tests.bug_fix_tests.compare_before_after --fix 5          # the Isolation Forest check only
+    python -m tests.bug_fix_tests.compare_before_after --fix 1 2 3 4 5 --output tests/bug_fix_tests/compare_result.md
+
+By default it compares fixes 1-4; `--fix 5` adds the Isolation Forest regression check, which must give the same result on both versions.
 
 For each fix it prints:
 
 * **the tests:** how many pass on each version (the tests of a bug fail on the original code; regression guards pass on both);
-* **cases:** a small input that triggers the bug, the output of each version, and *why the original output is wrong*. Cases on synthetic pcaps show the bug in isolation; cases on the real captures in `tests/data/` are the before/after measurements (packet bytes lost, flows and packets dropped, IPv6 flows merged, packets labeled `None`). Control cases must give the same output on both versions: e.g. `http.pcap`, recorded without a snaplen limit, and the Isolation Forest AUC, since that fix is already upstream.
+* **cases:** a small input that triggers the bug, the output of each version, and *why the original output is wrong*. Cases on synthetic pcaps show the bug in isolation; cases on the real captures in `tests/data/` are the before/after measurements (packet bytes lost, flows and packets dropped, IPv6 flows merged, packets labeled `None`). Control cases must give the same output on both versions: e.g. `http.pcap`, recorded without a snaplen limit.
 
-It ends with a summary, and flags any unexpected result (a case that should change but did not, a control that changed, or a test failing on the fixed code), with exit status 1 in that case. `--report FILE` also writes the comparison as Markdown; [`tests/bug_fix_tests/compare_report.md`](tests/bug_fix_tests/compare_report.md) is the report of the last run.
+It ends with a summary, and flags any unexpected result (a case that should change but did not, a control that changed, or a test failing on the fixed code), with exit status 1 in that case. `--output FILE` (or `-o FILE`) also writes the comparison as Markdown; [`tests/bug_fix_tests/compare_result.md`](tests/bug_fix_tests/compare_result.md) is the output of the last command above (all five, including the Isolation Forest check). It is the generated comparison results, not the project report ([REPORT.md](REPORT.md)).
 
 Changes to the existing tests (`tests/cli_tests/test_learn.py`):
 

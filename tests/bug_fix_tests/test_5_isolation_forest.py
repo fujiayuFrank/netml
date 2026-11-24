@@ -4,6 +4,9 @@ This bug was fixed upstream in noise-lab/netml#40 ("ndm.iforest: stop inverting 
 time"), so these tests pass against upstream master as well: they guard the fix against
 regressions. On netml 0.7.1 they fail.
 
+Skipped by default; run them with `python -m tests.bug_fix_tests --isolation-forest` (or set
+$NETML_CHECK_ISOLATION_FOREST, e.g. for `python -m unittest`).
+
 The bug
     pyod's IForest already turns scikit-learn's scores round, so that outliers get the higher
     scores (pyod's convention for every model). netml's IF wrapper turned them round a second time
@@ -13,6 +16,7 @@ The bug
 Affected
     IF.decision_function(), and so the AUC that ``netml learn --algorithm if`` reports.
 """
+import os
 import unittest
 
 import numpy as np
@@ -22,7 +26,8 @@ from sklearn.metrics import roc_auc_score
 from netml.ndm.iforest import IF
 from netml.pparser.parser import PCAP
 
-from ._helpers import DEMO_LABELS, DEMO_PCAP, RealCaptureTestCase, quiet
+from ._helpers import (DEMO_LABELS, DEMO_PCAP, ISOLATION_FOREST_VARIABLE, RealCaptureTestCase,
+                       quiet)
 
 RANDOM_STATE = 42
 
@@ -40,6 +45,9 @@ def _labeled_demo_features():
     return pcap.features, pcap.labels
 
 
+@unittest.skipUnless(os.environ.get(ISOLATION_FOREST_VARIABLE),
+                     'Isolation Forest regression check (fixed upstream in noise-lab/netml#40): '
+                     f'run with --isolation-forest or set {ISOLATION_FOREST_VARIABLE}')
 class IsolationForestTests(RealCaptureTestCase):
     """IF on the labeled flows of the Assignment 3 demo (102 flows, 16 of them anomalies)."""
 

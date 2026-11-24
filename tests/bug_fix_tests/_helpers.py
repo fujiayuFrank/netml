@@ -27,6 +27,11 @@ DEMO_LABELS = CAPTURES_DIR / 'demo.csv'
 # --synthetic-only` sets it.
 SYNTHETIC_ONLY_VARIABLE = 'NETML_SYNTHETIC_ONLY'
 
+# Set this variable (to any non-empty value) to run the Isolation Forest tests
+# (test_5_isolation_forest). That bug was fixed upstream (noise-lab/netml#40), so its tests are a
+# regression check, skipped by default. `python -m tests.bug_fix_tests --isolation-forest` sets it.
+ISOLATION_FOREST_VARIABLE = 'NETML_CHECK_ISOLATION_FOREST'
+
 MAC_SRC = '00:00:00:00:00:01'
 MAC_DST = '00:00:00:00:00:02'
 

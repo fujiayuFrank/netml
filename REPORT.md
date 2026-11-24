@@ -20,9 +20,9 @@ Repository: [github.com/fujiayuFrank/netml](https://github.com/fujiayuFrank/netm
 | 3 | IPv6 traffic merged into one fake flow, or crashing | `netflix.pcap`: 5 IPv6 connections merged into 1, header features crash → 5 flows, features extracted |
 | 4 | `pcap2pandas()` mislabels protocols and corrupts columns | 534 packets labeled `None` on 5 captures → 7; 282 DNS names stored as tuples → strings; every timestamp cut to the second → exact |
 
-We also found a fifth bug, Isolation Forest ranking anomalies backwards (AUC 0.405 on the Assignment 3 demo, worse than chance, instead of 0.595). It has since been fixed upstream ([noise-lab/netml#40](https://github.com/noise-lab/netml/pull/40)), so it is not part of our changes; we keep its test as a regression test, which passes against upstream `master` (see [Fix 5](#fix-5--isolation-forest-ranked-anomalies-backwards-fixed-upstream)).
+We also found a fifth bug, Isolation Forest ranking anomalies backwards (AUC 0.405 on the Assignment 3 demo, worse than chance, instead of 0.595). It has since been fixed upstream ([noise-lab/netml#40](https://github.com/noise-lab/netml/pull/40)), so it is not part of our changes; we keep its test as a regression check, skipped by default and run with its own command, which passes against upstream `master` (see [Fix 5](#fix-5--isolation-forest-ranked-anomalies-backwards-fixed-upstream)).
 
-Of the 47 tests we wrote for the four fixes, 37 fail on the original code and pass on ours; the other 10 pass on both, on purpose (they guard behavior that was already correct). The 3 regression tests for the upstream Isolation Forest fix pass on both. Everything reproduces with:
+Of the 47 tests we wrote for the four fixes, 37 fail on the original code and pass on ours; the other 10 pass on both, on purpose (they guard behavior that was already correct). The 3 tests of the upstream Isolation Forest fix are a separate regression check (`python -m tests.bug_fix_tests --isolation-forest`), and pass on both. Everything reproduces with:
 
 ```
 python -m tests.bug_fix_tests.compare_before_after
@@ -256,7 +256,7 @@ return _lookup_protocol_name(ETHER_TYPES, _get_ethertype(pkt))  # e.g. 0x88cc ->
 
 ### Fix 5 — Isolation Forest ranked anomalies backwards (fixed upstream)
 
-*We found and fixed this bug in NetML 0.7.1; the same fix has since been merged upstream in [noise-lab/netml#40](https://github.com/noise-lab/netml/pull/40) ("ndm.iforest: stop inverting IF scores a second time"). It is therefore not part of our changes, and the "before" code already includes it. Our test for it (`tests/bug_fix_tests/test_5_isolation_forest.py`) is kept as a regression test: it passes against upstream `master`, and fails on 0.7.1. The numbers below compare 0.7.1 with the fixed code.*
+*We found and fixed this bug in NetML 0.7.1; the same fix has since been merged upstream in [noise-lab/netml#40](https://github.com/noise-lab/netml/pull/40) ("ndm.iforest: stop inverting IF scores a second time"). It is therefore not part of our changes, and the "before" code already includes it. Our test for it (`tests/bug_fix_tests/test_5_isolation_forest.py`) is kept as a regression check, skipped by default and run with `python -m tests.bug_fix_tests --isolation-forest` (or `compare_before_after --fix 5`): it passes against upstream `master`, and fails on 0.7.1. The numbers below compare 0.7.1 with the fixed code.*
 
 **Symptom.** With `--algorithm if`, NetML reported an AUC below 0.5, i.e. worse than random guessing.
 
@@ -313,10 +313,12 @@ NetML supports Python 3.9–3.12. Use an environment like this one: in an unrela
 Then, from the repository root:
 
 ```
-python -m tests.bug_fix_tests.compare_before_after        # the full comparison (~3 minutes)
-python -m tests.bug_fix_tests.compare_before_after --synthetic-only      # synthetic only (2 s)
-python -m tests.bug_fix_tests.compare_before_after --report report.md    # also as Markdown
-python -m unittest                                        # the whole test suite (~2.5 minutes)
+python -m tests.bug_fix_tests.compare_before_after                   # fixes 1-4 (~3 minutes)
+python -m tests.bug_fix_tests.compare_before_after --synthetic-only  # synthetic only (2 s)
+python -m unittest                                   # the whole test suite (~2.5 minutes; skips the IF check)
+python -m tests.bug_fix_tests --isolation-forest     # the Isolation Forest regression check (seconds)
+python -m tests.bug_fix_tests.compare_before_after --fix 5           # ... compared on both versions
+python -m tests.bug_fix_tests.compare_before_after --fix 1 2 3 4 5 --output tests/bug_fix_tests/compare_result.md
 ```
 
 All data is in the repository (`tests/data/`, 155 MB, with a [README](tests/data/README.md) giving each file's source), so nothing needs to be downloaded or configured. For each fix, the comparison prints the bug, the test results on both versions, and every case with an explanation. An excerpt:
@@ -329,7 +331,7 @@ All data is in the repository (`tests/data/`, 155 MB, with a [README](tests/data
   itself produces: the final subflow of every split flow was lost.
 ```
 
-It ends with a summary of the last full run:
+By default (fixes 1–4) it ends with this summary:
 
 ```
 fix                      tests fail before, pass after     cases changed
@@ -337,12 +339,11 @@ fix                      tests fail before, pass after     cases changed
 2. Flow splitting                              7 of 10            6 of 6
 3. IPv6                                       10 of 11            6 of 6
 4. pcap2pandas                                14 of 16            8 of 9
-5. Isolation Forest (fixed upstream)           0 of 3            0 of 1
 
 No unexpected results.
 ```
 
-The cases that did not change are the controls, which must not change: `http.pcap` for fix 1, `time_normed` on in-order captures for fix 4, and the Isolation Forest AUC, since that fix is already in the "before" code (its 3 tests pass on both versions). The script flags any unexpected result: a case that should change but did not, a control that changed, or a test failing on the fixed code. The full report of the last run is [`tests/bug_fix_tests/compare_report.md`](tests/bug_fix_tests/compare_report.md).
+The two cases that did not change are the controls (`http.pcap` for fix 1, `time_normed` on in-order captures for fix 4), which must not change. The Isolation Forest check is left out by default; with `--fix 5` its 3 tests pass and its AUC is the same on both versions, since that fix is already in the "before" code. The script flags any unexpected result: a case that should change but did not, a control that changed, or a test failing on the fixed code. The full output of a run with all five (the last command above, which adds the Isolation Forest check: 0 of 3 tests and 0 of 1 cases change, as expected) is [`tests/bug_fix_tests/compare_result.md`](tests/bug_fix_tests/compare_result.md).
 
 ---
 
@@ -353,7 +354,7 @@ A few design choices turned out to matter as much as the fixes:
 - **Regression guards.** 9 of the tests pass on both versions by design: they check behavior that was already correct and must stay so. For example, "a flow with no long gaps stays whole" protects against the obvious-but-wrong fix for bug 2 (always appending the last subflow could duplicate an unsplit flow).
 - **Independent references.** A test should always find the correct answer from external reference (e.g., from the pcap file directly) instead of comparing to the code's own output. Otherwise, the test is just comparing if the result is the same as last time instead of if the result is correct.
 - **Tests must never hang.** Our first run froze for 40 minutes: comparing two 141,471-element lists with `assertEqual` makes unittest compute a full diff when they differ. Now long sequences are compared by counting mismatches, and every test has a time limit (60 s synthetic, 15 min real), so a slow test fails instead of hanging.
-- **Fast feedback.** `--synthetic-only` runs the 35 synthetic tests in about a second, so the fix logic can be checked on every edit; the real captures are for the final check.
+- **Fast feedback.** `--synthetic-only` runs the synthetic tests in about a second, so the fix logic can be checked on every edit; the real captures are for the final check.
 
 ---
 
